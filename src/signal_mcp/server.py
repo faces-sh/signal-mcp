@@ -11,6 +11,7 @@ from mcp.types import TextContent, Tool
 from .client import SignalClient, SignalError
 from .config import check_signal_cli_version, is_service_installed
 from . import store as _store
+from . import circuit_buffer as circuit   # Maestro handle bus (docs/reqs/007); no-op outside Maestro
 
 app = Server("signal-mcp")
 
@@ -1449,6 +1450,16 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    # Maestro circuit (docs/reqs/007): expand any @@hN@@ handle in the args before dispatch, then park a large
+    # result (e.g. a long conversation dump) behind a handle on the way out. No-op without the circuit env.
+    arguments = circuit.resolve_args(arguments or {})
+    result = await _call_tool_impl(name, arguments)
+    if result and getattr(result[0], "text", None):
+        result[0].text = circuit.wrap_result(result[0].text)
+    return result
+
+
+async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     client = get_client()
 
     try:
