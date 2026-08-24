@@ -59,8 +59,11 @@ async def test_send_group_message(client):
 @pytest.mark.asyncio
 async def test_send_message_rpc_error(client):
     respx.post(DAEMON_URL).mock(return_value=httpx.Response(200, json=rpc_err("User not registered")))
-    with pytest.raises(SignalError, match="User not registered"):
+    with pytest.raises(SignalError) as exc_info:
         await client.send_message("+19999999999", "Hi")
+    assert exc_info.value.code == "signal_cli_failed"
+    # signal-cli's own words survive untouched in the body (envelope rule 5)
+    assert "User not registered" in exc_info.value.body
 
 
 @respx.mock
@@ -659,8 +662,9 @@ async def test_get_attachment_not_found_raises(client, tmp_path, monkeypatch):
     att_dir = tmp_path / "att"
     att_dir.mkdir()
     monkeypatch.setattr(_client_mod, "ATTACHMENT_DIR", att_dir)
-    with pytest.raises(SignalError, match="not found"):
+    with pytest.raises(SignalError) as exc_info:
         client.get_attachment("ghost.jpg")
+    assert exc_info.value.code == "not_found"
 
 
 @pytest.mark.asyncio
@@ -746,7 +750,8 @@ async def test_contact_cache_retries_after_failure(client, monkeypatch):
     async def failing_list_contacts():
         nonlocal call_count
         call_count += 1
-        raise Exception("daemon not ready")
+        raise SignalError("the signal-cli daemon is not accepting connections.",
+                          code="daemon_unavailable")
 
     monkeypatch.setattr(client, "list_contacts", failing_list_contacts)
     await client._ensure_contact_cache()
@@ -784,8 +789,9 @@ def test_check_signal_cli_version_timeout(monkeypatch):
         raise subprocess.TimeoutExpired(cmd="signal-cli", timeout=10)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    with pytest.raises(RuntimeError, match="timed out"):
+    with pytest.raises(RuntimeError) as exc_info:
         _config_mod.check_signal_cli_version()
+    assert exc_info.value.code == "timeout"
 
 
 def test_check_signal_cli_version_nonzero_exit(monkeypatch):
@@ -809,8 +815,9 @@ def test_check_signal_cli_version_not_found(monkeypatch):
         raise FileNotFoundError
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    with pytest.raises(RuntimeError, match="not found"):
+    with pytest.raises(RuntimeError) as exc_info:
         _config_mod.check_signal_cli_version()
+    assert exc_info.value.code == "not_installed"
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -956,13 +963,17 @@ async def test_send_message_accepts_valid_e164(client):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_identity_error_includes_hint(client):
+async def test_identity_error_is_passed_through_unannotated(client):
+    """signal-cli's message arrives verbatim, with no remedy bolted on (rules 5 and 7)."""
     respx.post(DAEMON_URL).mock(return_value=httpx.Response(200, json={
         "jsonrpc": "2.0", "id": 1,
         "error": {"code": -1, "message": "Untrusted identity key for +19999999999"},
     }))
-    with pytest.raises(SignalError, match="trust_identity"):
+    with pytest.raises(SignalError) as exc_info:
         await client._rpc("send", {})
+    assert exc_info.value.code == "signal_cli_failed"
+    assert "Untrusted identity key for +19999999999" in exc_info.value.body
+    assert "trust_identity" not in exc_info.value.body
 
 
 # ── Enriched list_conversations ────────────────────────────────────────────────
@@ -1277,7 +1288,11 @@ def test_parse_attachments_metadata(client):
     assert len(atts) == 1
     assert atts[0].width == 1920
     assert atts[0].height == 1080
-    assert atts[0].caption == "Look at this!"
+    # /tmp/photo.jpg does not exist, so the copy fails: the caption says so and
+    # local_path is cleared rather than pointing at a file nobody can open.
+    assert atts[0].caption.startswith("Look at this!")
+    assert "attachment not saved locally" in atts[0].caption
+    assert atts[0].local_path is None
 
 
 # ── send_attachment multiple paths ───────────────────────────────────────────

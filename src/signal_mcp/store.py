@@ -5,6 +5,7 @@ import io
 import json
 import sqlite3
 import stat
+import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -35,8 +36,11 @@ def _connect() -> sqlite3.Connection:
     # Restrict permissions to owner-only on first creation
     try:
         DB_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Not worth failing the read over, but a message store left readable by
+        # everyone is not something to fail silently about either.
+        print(f"[signal-mcp] could not restrict permissions on {DB_PATH}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     return conn
 
 
@@ -118,11 +122,13 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_scheduled_status ON scheduled_messages(status, send_at);
         """)
-        # Migrate: add recipient column if upgrading from pre-1.1 schema
-        try:
+        # Migrate: add recipient column if upgrading from pre-1.1 schema.
+        # Asked, not attempted-and-swallowed: catching OperationalError here also
+        # swallowed "database is locked", which is a very different thing from
+        # "the column is already there".
+        existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "recipient" not in existing_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN recipient TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
         # Indexes on recipient must be created after migration (column may have just been added)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient)"
@@ -218,7 +224,9 @@ def search_messages(
                    ORDER BY m.timestamp DESC LIMIT ? OFFSET ?""",
                 [_safe_fts_query(query)] + sender_args + [limit, offset],
             ).fetchall()
-        except Exception:
+        except sqlite3.OperationalError:
+            # FTS5 rejected the query syntax. Narrow on purpose: a locked or corrupt
+            # database must not be answered with LIKE results as though nothing happened.
             # Escape LIKE wildcards so literal % and _ in query don't over-match
             like_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             rows = conn.execute(

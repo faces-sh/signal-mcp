@@ -12,6 +12,7 @@ import signal_mcp.server as server_mod
 from signal_mcp.config import DAEMON_URL
 from signal_mcp.client import SignalClient, SignalError
 from signal_mcp.server import call_tool, get_client, TOOLS
+from tests.envelope_helpers import failure
 from mcp.types import Tool
 
 
@@ -74,12 +75,14 @@ async def test_receive_messages_reraises_non_background_error(reset_server):
     client = reset_server
 
     async def bad_receive(**kwargs):
-        raise SignalError("daemon not running")
+        raise SignalError("the signal-cli daemon is not accepting connections.",
+                          code="daemon_unavailable",
+                          body="ConnectError: All connection attempts failed")
 
     client.receive_messages = bad_receive
 
     result = await call_tool("receive_messages", {"timeout": 1})
-    # The re-raised error should be caught by the outer try/except in call_tool
-    # and returned as an error TextContent
-    assert result[0].text.startswith("Error:")
-    assert "daemon not running" in result[0].text
+    # The re-raised error reaches the outer handler and comes back as an envelope
+    code, text = failure(result)
+    assert code == "daemon_unavailable"
+    assert "ConnectError: All connection attempts failed" in text

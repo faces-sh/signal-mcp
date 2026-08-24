@@ -83,10 +83,15 @@ def receive(watch: bool, timeout: int, interval: int, as_json: bool, webhook_url
       SIGNAL_MCP_WEBHOOK=http://... signal-mcp receive --watch
     """
     from .config import get_webhook_url
+    from .envelope import ToolFailure
     from .webhook import post_webhook_batch
 
     # Resolve webhook URL: flag > env/config
-    effective_webhook = webhook_url or get_webhook_url()
+    try:
+        effective_webhook = webhook_url or get_webhook_url()
+    except ToolFailure as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
 
     def _emit(messages):
         """Print messages and/or POST to webhook."""
@@ -835,7 +840,12 @@ def set_webhook(url: str | None):
 def get_webhook():
     """Show the currently configured webhook URL."""
     from .config import get_webhook_url
-    url = get_webhook_url()
+    from .envelope import ToolFailure
+    try:
+        url = get_webhook_url()
+    except ToolFailure as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
     if url:
         click.echo(url)
     else:

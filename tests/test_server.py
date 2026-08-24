@@ -13,6 +13,7 @@ from signal_mcp.config import DAEMON_URL
 from signal_mcp.models import Message
 from signal_mcp.server import call_tool
 from signal_mcp.client import SignalClient
+from tests.envelope_helpers import failure, failure_code, failure_text
 
 
 def rpc_ok(result) -> dict:
@@ -62,7 +63,7 @@ async def test_tool_list_groups_empty():
 @pytest.mark.asyncio
 async def test_tool_unknown():
     result = await call_tool("nonexistent_tool", {})
-    assert "Unknown tool" in result[0].text
+    assert failure_code(result) == "unknown_tool"
 
 
 @respx.mock
@@ -111,9 +112,23 @@ async def test_tool_receive_empty():
 
 
 @pytest.mark.asyncio
-async def test_tool_get_unread_empty():
+async def test_tool_get_unread_empty(monkeypatch):
+    """An empty store is only "no unread messages" when the poll actually happened."""
+    monkeypatch.setattr("signal_mcp.server.is_service_installed", lambda: True)
     result = await call_tool("get_unread", {})
     assert "[]" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_tool_get_unread_fails_when_poll_fails(monkeypatch):
+    """A poll that could not run must not be answered with an empty inbox (rule 6)."""
+    import signal_mcp.server as _srv
+    monkeypatch.setattr("signal_mcp.server.is_service_installed", lambda: False)
+    monkeypatch.setattr(_srv, "_last_freshen_at", 0.0)
+    result = await call_tool("get_unread", {})
+    code, text = failure(result)
+    assert code == "daemon_unavailable"
+    assert "[]" not in text
 
 
 @respx.mock
@@ -129,7 +144,7 @@ async def test_tool_import_desktop_missing_db():
     with patch("signal_mcp.desktop.SIGNAL_DB") as mock_db:
         mock_db.exists.return_value = False
         result = await call_tool("import_desktop", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "db_missing"
 
 
 @pytest.mark.asyncio
@@ -149,8 +164,10 @@ async def test_call_tool_unexpected_exception_returns_error(monkeypatch):
     monkeypatch.setattr(_srv, "_DAEMON_FREE", orig | {"store_stats"})
     monkeypatch.setattr(_store_mod, "get_stats", lambda **kw: (_ for _ in ()).throw(RuntimeError("db exploded")))
     result = await call_tool("store_stats", {})
-    text = result[0].text
-    assert "error" in text.lower() or "unexpected" in text.lower()
+    code, text = failure(result)
+    assert code == "unexpected_error"
+    # The traceback is the evidence and travels verbatim (rule 5)
+    assert "db exploded" in text
 
 
 @pytest.mark.asyncio
@@ -527,7 +544,7 @@ async def test_tool_get_attachment_not_found(tmp_path, monkeypatch):
     att_dir.mkdir()
     monkeypatch.setattr(_client_mod, "ATTACHMENT_DIR", att_dir)
     result = await call_tool("get_attachment", {"filename": "missing.jpg"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "not_found"
 
 
 @pytest.mark.asyncio
@@ -566,15 +583,18 @@ async def test_get_conversation_enriches_sender_name(monkeypatch):
 async def test_missing_required_param_returns_error():
     """Missing required params should return a clean error, not a KeyError."""
     result = await call_tool("send_message", {"recipient": "+19999999999"})  # missing "message"
-    assert "Missing required parameter" in result[0].text
-    assert "message" in result[0].text
+    code, text = failure(result)
+    assert code == "bad_request"
+    assert "message" in text
 
 
 @pytest.mark.asyncio
 async def test_missing_multiple_required_params():
     result = await call_tool("send_message", {})
-    assert "recipient" in result[0].text
-    assert "message" in result[0].text
+    code, text = failure(result)
+    assert code == "bad_request"
+    assert "recipient" in text
+    assert "message" in text
 
 
 # ── Configuration tools ────────────────────────────────────────────────────────
@@ -623,7 +643,7 @@ async def test_tool_add_sticker_pack():
 @pytest.mark.asyncio
 async def test_tool_add_sticker_pack_missing_uri():
     result = await call_tool("add_sticker_pack", {})
-    assert "Missing required parameter" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── Store management tools ─────────────────────────────────────────────────────
@@ -643,7 +663,7 @@ async def test_tool_clear_local_store():
 @pytest.mark.asyncio
 async def test_tool_clear_local_store_requires_confirm():
     result = await call_tool("clear_local_store", {"confirm": False})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 @pytest.mark.asyncio
@@ -699,8 +719,9 @@ async def test_get_conversation_has_more_false_when_all_returned():
 @pytest.mark.asyncio
 async def test_tool_send_message_invalid_number():
     result = await call_tool("send_message", {"recipient": "notanumber", "message": "hi"})
-    assert "Error" in result[0].text
-    assert "E.164" in result[0].text
+    code, text = failure(result)
+    assert code == "bad_request"
+    assert "E.164" in text
 
 
 # ── search_messages with sender filter ────────────────────────────────────────
@@ -746,13 +767,13 @@ async def test_tool_export_messages_csv():
 @pytest.mark.asyncio
 async def test_tool_export_messages_invalid_format():
     result = await call_tool("export_messages", {"format": "xml"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 @pytest.mark.asyncio
 async def test_tool_export_messages_invalid_since():
     result = await call_tool("export_messages", {"since": "not-a-date"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── set_expiration_timer ──────────────────────────────────────────────────────
@@ -782,7 +803,7 @@ async def test_tool_set_expiration_timer_group():
 @pytest.mark.asyncio
 async def test_tool_set_expiration_timer_missing_param():
     result = await call_tool("set_expiration_timer", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── receive_messages with message data ───────────────────────────────────────
@@ -818,13 +839,14 @@ async def test_tool_receive_messages_with_data():
 @pytest.mark.asyncio
 async def test_tool_receive_messages_invalid_timeout():
     result = await call_tool("receive_messages", {"timeout": "bad"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── get_unread auto-marks as read ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_tool_get_unread_marks_as_read():
+async def test_tool_get_unread_marks_as_read(monkeypatch):
+    monkeypatch.setattr("signal_mcp.server.is_service_installed", lambda: True)
     from datetime import datetime as _dt
     _store_mod.init_db()
     _store_mod.save_message(Message(
@@ -855,7 +877,7 @@ async def test_tool_get_user_status():
 @pytest.mark.asyncio
 async def test_tool_get_user_status_missing_param():
     result = await call_tool("get_user_status", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── send_sync_request ─────────────────────────────────────────────────────────
@@ -932,7 +954,7 @@ async def test_tool_pin_message():
 @pytest.mark.asyncio
 async def test_tool_pin_message_missing_conversation():
     result = await call_tool("pin_message", {"target_author": "+1", "target_timestamp": 123})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 @respx.mock
@@ -962,7 +984,7 @@ async def test_tool_admin_delete_message():
 @pytest.mark.asyncio
 async def test_tool_admin_delete_missing_param():
     result = await call_tool("admin_delete_message", {"group_id": "grp=="})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── send_contacts_sync ────────────────────────────────────────────────────────
@@ -991,7 +1013,7 @@ async def test_tool_update_device():
 @pytest.mark.asyncio
 async def test_tool_update_device_missing_param():
     result = await call_tool("update_device", {"device_id": 2})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── mark_as_unread ────────────────────────────────────────────────────────────
@@ -1014,7 +1036,7 @@ async def test_tool_mark_as_unread():
 @pytest.mark.asyncio
 async def test_tool_mark_as_unread_missing_param():
     result = await call_tool("mark_as_unread", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── get_avatar ────────────────────────────────────────────────────────────────
@@ -1067,13 +1089,13 @@ async def test_tool_create_poll_too_few_options():
     result = await call_tool("create_poll", {
         "question": "Q?", "options": ["Only one"], "group_id": "grp==",
     })
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 @pytest.mark.asyncio
 async def test_tool_create_poll_missing_conversation():
     result = await call_tool("create_poll", {"question": "Q?", "options": ["A", "B"]})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── vote_poll ─────────────────────────────────────────────────────────────────
@@ -1125,7 +1147,7 @@ async def test_tool_send_attachment_paths_array(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_send_attachment_no_path():
     result = await call_tool("send_attachment", {"recipient": "+1"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── sendReceipt fix ───────────────────────────────────────────────────────────
@@ -1152,7 +1174,7 @@ async def test_tool_get_sticker():
 @pytest.mark.asyncio
 async def test_tool_get_sticker_missing_params():
     result = await call_tool("get_sticker", {"pack_id": "abc"})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── upload_sticker_pack ───────────────────────────────────────────────────────
@@ -1171,7 +1193,7 @@ async def test_tool_upload_sticker_pack(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_upload_sticker_pack_missing_path():
     result = await call_tool("upload_sticker_pack", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 # ── list_accounts ─────────────────────────────────────────────────────────────
@@ -1202,8 +1224,7 @@ async def test_get_conversation_invalid_since_returns_error():
     result = await call_tool("get_conversation", {
         "recipient": "+19999999999", "since": "not-a-date"
     })
-    text = result[0].text
-    assert "error" in text.lower() or "invalid" in text.lower()
+    assert failure_code(result) == "bad_request"
 
 
 # ── send_group_attachment missing path ───────────────────────────────────────
@@ -1212,8 +1233,7 @@ async def test_get_conversation_invalid_since_returns_error():
 async def test_send_group_attachment_missing_path_returns_error():
     """send_group_attachment with no path/paths must return an error, not crash."""
     result = await call_tool("send_group_attachment", {"group_id": "grp=="})
-    text = result[0].text
-    assert "error" in text.lower() or "path" in text.lower()
+    assert failure_code(result) == "bad_request"
 
 
 # ── unpin_message / vote_poll / terminate_poll missing recipient+group ────────
@@ -1224,8 +1244,7 @@ async def test_unpin_message_missing_target_returns_error():
     result = await call_tool("unpin_message", {
         "target_author": "+1", "target_timestamp": 123
     })
-    text = result[0].text
-    assert "error" in text.lower() or "required" in text.lower()
+    assert failure_code(result) == "bad_request"
 
 
 @pytest.mark.asyncio
@@ -1235,8 +1254,7 @@ async def test_vote_poll_missing_target_returns_error():
         "target_author": "+1", "target_timestamp": 123,
         "poll_id": 1, "votes": [0]
     })
-    text = result[0].text
-    assert "error" in text.lower() or "required" in text.lower()
+    assert failure_code(result) == "bad_request"
 
 
 @pytest.mark.asyncio
@@ -1246,8 +1264,7 @@ async def test_terminate_poll_missing_target_returns_error():
     result = await call_tool("terminate_poll", {
         "target_author": "+1", "target_timestamp": 123, "poll_id": 1
     })
-    text = result[0].text
-    assert "error" in text.lower() or "required" in text.lower()
+    assert failure_code(result) == "bad_request"
 
 
 # ── update_account ────────────────────────────────────────────────────────────
@@ -1275,7 +1292,7 @@ async def test_tool_set_pin():
 @pytest.mark.asyncio
 async def test_tool_set_pin_missing():
     result = await call_tool("set_pin", {})
-    assert "Error" in result[0].text
+    assert failure_code(result) == "bad_request"
 
 
 @respx.mock
@@ -1330,16 +1347,37 @@ async def test_freshen_store_cooldown_skips_poll(monkeypatch):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_freshen_store_swallows_receive_exception(monkeypatch):
-    """_freshen_store must not propagate exceptions from receive_messages."""
+async def test_freshen_store_surfaces_receive_failure(monkeypatch):
+    """A failed poll is reported, not hidden behind a stale, plausible-looking store.
+
+    This used to swallow the exception and answer with whatever the store already
+    held, which reads as "you have no new messages" when the truth is "I could not
+    look" (rule 6).
+    """
     import signal_mcp.server as _srv
     monkeypatch.setattr("signal_mcp.server.is_service_installed", lambda: False)
     monkeypatch.setattr(_srv, "_last_freshen_at", 0.0)
     # Simulate receive_messages failing (connection error)
-    respx.post(DAEMON_URL).mock(side_effect=Exception("daemon gone"))
+    respx.post(DAEMON_URL).mock(side_effect=httpx.ConnectError("daemon gone"))
+    result = await call_tool("get_unread", {})
+    code, text = failure(result)
+    assert code == "daemon_unavailable"
+    assert "_warning" not in text
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_freshen_store_allows_concurrent_receive(monkeypatch):
+    """The one condition that may pass: another process already holds the receive."""
+    import signal_mcp.server as _srv
+    monkeypatch.setattr("signal_mcp.server.is_service_installed", lambda: False)
+    monkeypatch.setattr(_srv, "_last_freshen_at", 0.0)
+    respx.post(DAEMON_URL).mock(return_value=httpx.Response(200, json={
+        "jsonrpc": "2.0", "id": 1,
+        "error": {"code": -1, "message": "Messages are already being received"},
+    }))
     result = await call_tool("get_unread", {})
     data = json.loads(result[0].text)
-    # Must still return a well-formed response, not propagate the exception
     assert "messages" in data
     assert "_warning" in data
 
@@ -1405,7 +1443,7 @@ async def test_prune_store_default_days(monkeypatch):
 @pytest.mark.asyncio
 async def test_prune_store_rejects_zero_days():
     result = await call_tool("prune_store", {"days": 0})
-    assert result[0].text.startswith("Error:")
+    assert failure_code(result) == "bad_request"
 
 
 # ── start/finish_change_number + submit_rate_limit_challenge ──────────────────

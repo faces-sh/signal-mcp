@@ -2,15 +2,20 @@
 
 import asyncio
 import json
+import sqlite3
+import traceback
 from datetime import datetime
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
-from .client import SignalClient, SignalError
+from .client import ALREADY_RECEIVING, SignalClient, SignalError
 from .config import check_signal_cli_version, is_service_installed
+from . import envelope
+from .envelope import ToolFailure
 from . import store as _store
+from . import circuit_buffer as circuit   # Maestro handle bus (docs/reqs/007); no-op outside Maestro
 
 app = Server("signal-mcp")
 
@@ -43,15 +48,116 @@ def _ok(data) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
 
 
-def _err(msg: str) -> list[TextContent]:
-    return [TextContent(type="text", text=f"Error: {msg}")]
+# What each tool was trying to do, in the words a person would use. Line 1 of the
+# envelope reads "Could not <this>: <detail>" (rule 3). Tools not listed here fall
+# back to their own name with the underscores taken out.
+_WHAT: dict[str, str] = {
+    "send_message": "send the message",
+    "send_group_message": "send the message to that group",
+    "send_note_to_self": "save the note to yourself",
+    "send_attachment": "send the attachment",
+    "send_group_attachment": "send the attachment to that group",
+    "send_sticker": "send the sticker",
+    "send_group_sticker": "send the sticker to that group",
+    "edit_message": "edit that message",
+    "react_to_message": "send the reaction",
+    "receive_messages": "check Signal for new messages",
+    "get_unread": "read your unread Signal messages",
+    "get_conversation": "read that Signal conversation",
+    "search_messages": "search your Signal messages",
+    "list_contacts": "list your Signal contacts",
+    "find_contact": "find that Signal contact",
+    "list_groups": "list your Signal groups",
+    "list_conversations": "list your Signal conversations",
+    "list_accounts": "list your Signal accounts",
+    "get_own_number": "work out your own Signal number",
+    "import_desktop": "import your Signal Desktop history",
+    "sync_desktop": "sync new messages from Signal Desktop",
+    "store_stats": "read the local Signal message store",
+    "export_messages": "export your Signal messages",
+    "list_attachments": "list your downloaded Signal attachments",
+    "get_attachment": "open that Signal attachment",
+    "schedule_message": "schedule the message",
+    "cancel_scheduled_message": "cancel that scheduled message",
+    "list_scheduled_messages": "list your scheduled messages",
+    "run_scheduled_messages": "send the scheduled messages",
+    "get_profile": "read that contact's Signal profile",
+    "get_user_status": "check whether those numbers are on Signal",
+}
+
+
+def _fail(tool: str, code: str, detail: str,
+          body: str | None = None, http: str | None = None) -> CallToolResult:
+    """Every failure this server returns is built here (docs/MCP_FAILURE_ENVELOPE.md).
+
+    isError is always true, the code always leads the text in brackets, and the body
+    is whatever signal-cli, sqlcipher or SQLite said, unedited apart from redaction.
+    """
+    what = _WHAT.get(tool, tool.replace("_", " "))
+    return envelope.failure(code, f"Could not {what}: {detail}", body, http)
+
+
+# Required parameters per tool. Checked before anything is started or contacted,
+# so a malformed request gets a clean [bad_request] rather than a KeyError or a
+# ten-second wait for a daemon it was never going to need.
+_REQUIRED: dict[str, list[str]] = {
+    "send_message":         ["recipient", "message"],
+    "send_group_message":   ["group_id", "message"],
+    "send_note_to_self":    ["message"],
+    "send_attachment":      ["recipient"],
+    "send_group_attachment":["group_id"],
+    "send_sticker":         ["recipient", "pack_id", "sticker_id"],
+    "send_group_sticker":   ["group_id", "pack_id", "sticker_id"],
+    "get_conversation":     ["recipient"],
+    "search_messages":      ["query"],
+    "react_to_message":     ["target_author", "target_timestamp", "emoji"],
+    "set_typing":           ["recipient"],
+    "get_profile":          ["number"],
+    "block_contact":        ["number"],
+    "unblock_contact":      ["number"],
+    "remove_contact":       ["number"],
+    "update_contact":       ["number", "name"],
+    "create_group":         ["name", "members"],
+    "join_group":           ["uri"],
+    "add_device":           ["uri"],
+    "remove_device":        ["device_id"],
+    "delete_message":       ["recipient", "target_timestamp"],
+    "delete_group_message": ["group_id", "target_timestamp"],
+    "send_read_receipt":    ["sender", "timestamps"],
+    "update_group":         ["group_id"],
+    "leave_group":          ["group_id"],
+    "set_expiration_timer": ["expiration_seconds"],
+    "trust_identity":       ["number"],
+    "get_attachment":       ["filename"],
+    "add_sticker_pack":     ["uri"],
+    "get_sticker":          ["pack_id", "sticker_id"],
+    "upload_sticker_pack":  ["path"],
+    "set_pin":              ["pin"],
+    "edit_message":         ["target_timestamp", "message"],
+    "clear_local_store":    ["confirm"],
+    "delete_local_messages":["recipient"],
+    "get_user_status":      ["recipients"],
+    "pin_message":                    ["target_author", "target_timestamp"],
+    "unpin_message":                  ["target_author", "target_timestamp"],
+    "admin_delete_message":           ["group_id", "target_author", "target_timestamp"],
+    "update_device":                  ["device_id", "name"],
+    "mark_as_unread":                 ["message_ids"],
+    "get_avatar":                     ["identifier"],
+    "send_message_request_response":  ["sender", "accept"],
+    "create_poll":                    ["question", "options"],
+    "vote_poll":                      ["target_author", "target_timestamp", "poll_id", "votes"],
+    "terminate_poll":                 ["target_author", "target_timestamp", "poll_id"],
+    "start_change_number":            ["number"],
+    "finish_change_number":           ["number", "verification_code"],
+    "submit_rate_limit_challenge":    ["challenge", "captcha"],
+}
 
 
 def _require(arguments: dict, *keys: str) -> str | None:
-    """Return an error string if any required key is missing, else None."""
+    """Return a plain description of what is missing, or None when nothing is."""
     missing = [k for k in keys if k not in arguments]
     if missing:
-        return f"Missing required parameter(s): {', '.join(missing)}"
+        return f"the request did not include {', '.join(missing)}."
     return None
 
 
@@ -1442,75 +1548,55 @@ TOOLS += [
 ]
 
 
+_TOOL_NAMES = {t.name for t in TOOLS}
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return TOOLS
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
+    # Maestro circuit (docs/reqs/007): expand any @@hN@@ handle in the args before dispatch, then park a large
+    # result (e.g. a long conversation dump) behind a handle on the way out. No-op without the circuit env.
+    try:
+        arguments = circuit.resolve_args(arguments or {})
+    except circuit.CircuitError as e:
+        return _fail(name, "circuit_unresolved",
+                     "a handle in the arguments could not be expanded.", str(e))
+    except Exception as e:
+        return _fail(name, "circuit_unavailable",
+                     "the handle cache could not be reached to expand the arguments.",
+                     f"{type(e).__name__}: {e}")
+
+    result = await _call_tool_impl(name, arguments)
+    # A failure envelope has to lead with its [code] and carry its evidence, so it is
+    # never parked behind a circuit slug. Only successful results go through the cache.
+    if isinstance(result, CallToolResult):
+        return result
+    if result and getattr(result[0], "text", None):
+        result[0].text = circuit.wrap_result(result[0].text)
+    return result
+
+
+async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     client = get_client()
 
     try:
-        if name not in _DAEMON_FREE:
-            await client.ensure_daemon()
+        # Neither of these needs signal-cli, so they answer before anything is
+        # started or contacted: an unknown tool used to report that the daemon
+        # would not start, which is true but not the answer to the question.
+        if name not in _TOOL_NAMES:
+            return _fail(name, "unknown_tool", "this server has no tool by that name.")
 
-        # Validate required parameters up front (gives clean error instead of KeyError)
-        _REQUIRED: dict[str, list[str]] = {
-            "send_message":         ["recipient", "message"],
-            "send_group_message":   ["group_id", "message"],
-            "send_note_to_self":    ["message"],
-            "send_attachment":      ["recipient"],
-            "send_group_attachment":["group_id"],
-            "send_sticker":         ["recipient", "pack_id", "sticker_id"],
-            "send_group_sticker":   ["group_id", "pack_id", "sticker_id"],
-            "get_conversation":     ["recipient"],
-            "search_messages":      ["query"],
-            "react_to_message":     ["target_author", "target_timestamp", "emoji"],
-            "set_typing":           ["recipient"],
-            "get_profile":          ["number"],
-            "block_contact":        ["number"],
-            "unblock_contact":      ["number"],
-            "remove_contact":       ["number"],
-            "update_contact":       ["number", "name"],
-            "create_group":         ["name", "members"],
-            "join_group":           ["uri"],
-            "add_device":           ["uri"],
-            "remove_device":        ["device_id"],
-            "delete_message":       ["recipient", "target_timestamp"],
-            "delete_group_message": ["group_id", "target_timestamp"],
-            "send_read_receipt":    ["sender", "timestamps"],
-            "update_group":         ["group_id"],
-            "leave_group":          ["group_id"],
-            "set_expiration_timer": ["expiration_seconds"],
-            "trust_identity":       ["number"],
-            "get_attachment":       ["filename"],
-            "add_sticker_pack":     ["uri"],
-            "get_sticker":          ["pack_id", "sticker_id"],
-            "upload_sticker_pack":  ["path"],
-            "set_pin":              ["pin"],
-            "edit_message":         ["target_timestamp", "message"],
-            "clear_local_store":    ["confirm"],
-            "delete_local_messages":["recipient"],
-            "get_user_status":      ["recipients"],
-            "pin_message":                    ["target_author", "target_timestamp"],
-            "unpin_message":                  ["target_author", "target_timestamp"],
-            "admin_delete_message":           ["group_id", "target_author", "target_timestamp"],
-            "update_device":                  ["device_id", "name"],
-            "mark_as_unread":                 ["message_ids"],
-            "get_avatar":                     ["identifier"],
-            "send_message_request_response":  ["sender", "accept"],
-            "create_poll":                    ["question", "options"],
-            "vote_poll":                      ["target_author", "target_timestamp", "poll_id", "votes"],
-            "terminate_poll":                 ["target_author", "target_timestamp", "poll_id"],
-            "start_change_number":            ["number"],
-            "finish_change_number":           ["number", "verification_code"],
-            "submit_rate_limit_challenge":    ["challenge", "captcha"],
-        }
         if name in _REQUIRED:
             err = _require(arguments, *_REQUIRED[name])
             if err:
-                return _err(err)
+                return _fail(name, "bad_request", err)
+
+        if name not in _DAEMON_FREE:
+            await client.ensure_daemon()
 
         if name == "send_message":
             result = await client.send_message(
@@ -1565,13 +1651,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             try:
                 timeout = int(arguments.get("timeout", 5))
             except (TypeError, ValueError):
-                return _err("timeout must be an integer number of seconds")
+                return _fail(name, "bad_request",
+                             "timeout must be a whole number of seconds.")
             try:
                 messages = await client.receive_messages(timeout=timeout)
                 return _ok([client._enrich_message(m) for m in messages])
-            except Exception as e:
-                if "already being received" in str(e):
-                    # Background service is running — read from store instead
+            except SignalError as e:
+                # Only the one condition signal-cli names may take this route: another
+                # process holds the receive, so the store is already being fed and
+                # reading it IS the answer. Anything else is a failure and stays one.
+                if ALREADY_RECEIVING in f"{e.detail} {e.body or ''}":
                     from signal_mcp.store import get_unread_messages as _get_unread
                     msgs = await asyncio.to_thread(_get_unread, client.account, 50)
                     return _ok({
@@ -1594,7 +1683,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 try:
                     since = datetime.fromisoformat(arguments["since"])
                 except ValueError:
-                    return _err(f"Invalid since date: {arguments['since']}")
+                    return _fail(name, "bad_request",
+                                 f"'{arguments['since']}' is not an ISO datetime.")
             limit = arguments.get("limit", 50)
             offset = arguments.get("offset", 0)
             await client._ensure_caches()
@@ -1628,7 +1718,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "send_attachment":
             path_arg = arguments.get("paths") or arguments.get("path")
             if not path_arg:
-                return _err("Either path or paths is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither path nor paths.")
             result = await client.send_attachment(
                 arguments["recipient"],
                 path_arg,
@@ -1640,7 +1731,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "send_group_attachment":
             path_arg = arguments.get("paths") or arguments.get("path")
             if not path_arg:
-                return _err("Either path or paths is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither path nor paths.")
             result = await client.send_group_attachment(
                 arguments["group_id"],
                 path_arg,
@@ -1741,20 +1833,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _ok(_store.get_stats(own_number=client.account))
 
         elif name == "import_desktop":
-            from .desktop import import_from_desktop, DesktopImportError
-            try:
-                result = import_from_desktop()
-                return _ok(result)
-            except DesktopImportError as e:
-                return _err(str(e))
+            from .desktop import import_from_desktop
+            return _ok(import_from_desktop())
 
         elif name == "sync_desktop":
-            from .desktop import sync_from_desktop, DesktopImportError
-            try:
-                result = sync_from_desktop()
-                return _ok(result)
-            except DesktopImportError as e:
-                return _err(str(e))
+            from .desktop import sync_from_desktop
+            return _ok(sync_from_desktop())
 
         elif name == "list_conversations":
             await client._ensure_caches()
@@ -1798,7 +1882,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "pin_message":
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either recipient or group_id is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             await client.pin_message(
                 target_author=arguments["target_author"],
                 target_timestamp=arguments["target_timestamp"],
@@ -1809,7 +1894,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "unpin_message":
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either recipient or group_id is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             await client.unpin_message(
                 target_author=arguments["target_author"],
                 target_timestamp=arguments["target_timestamp"],
@@ -1909,7 +1995,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "clear_local_store":
             if not arguments.get("confirm"):
-                return _err("confirm must be true to delete all local messages")
+                return _fail(name, "bad_request",
+                             "confirm was not set to true, and this deletes every "
+                             "locally stored message.")
             count = await client.clear_local_store()
             return _ok({"deleted": count, "status": "cleared"})
 
@@ -1940,10 +2028,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "create_poll":
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either recipient or group_id is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             options = arguments.get("options", [])
             if len(options) < 2:
-                return _err("Poll requires at least 2 options")
+                return _fail(name, "bad_request", "a poll needs at least two options.")
             result = await client.create_poll(
                 question=arguments["question"],
                 options=options,
@@ -1955,7 +2044,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "vote_poll":
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either recipient or group_id is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             await client.vote_poll(
                 target_author=arguments["target_author"],
                 target_timestamp=arguments["target_timestamp"],
@@ -1968,7 +2058,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "terminate_poll":
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either recipient or group_id is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             await client.terminate_poll(
                 target_author=arguments["target_author"],
                 target_timestamp=arguments["target_timestamp"],
@@ -1981,14 +2072,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "export_messages":
             fmt = arguments.get("format", "json")
             if fmt not in ("json", "csv"):
-                return _err("format must be 'json' or 'csv'")
+                return _fail(name, "bad_request", "format must be json or csv.")
             since_str = arguments.get("since")
             since = None
             if since_str:
                 try:
                     since = datetime.fromisoformat(since_str)
                 except ValueError:
-                    return _err(f"Invalid since datetime: {since_str!r}")
+                    return _fail(name, "bad_request",
+                                 f"{since_str!r} is not an ISO datetime.")
             data = await client.export_messages(
                 fmt=fmt,
                 recipient=arguments.get("recipient"),
@@ -1999,7 +2091,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "prune_store":
             days = int(arguments.get("days", 180))
             if days <= 0:
-                return _err("days must be a positive integer")
+                return _fail(name, "bad_request", "days must be a positive whole number.")
             count = await asyncio.to_thread(_store.prune_old_messages, days)
             return _ok({"deleted": count, "older_than_days": days})
 
@@ -2042,7 +2134,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "find_contact":
             err = _require(arguments, "query")
             if err:
-                return _err(err)
+                return _fail(name, "bad_request", err)
             await client.ensure_daemon()
             contacts = await client.list_contacts(search=arguments["query"])
             return _ok([c.to_dict() for c in contacts])
@@ -2050,9 +2142,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "schedule_message":
             err = _require(arguments, "message", "send_at")
             if err:
-                return _err(err)
+                return _fail(name, "bad_request", err)
             if not arguments.get("recipient") and not arguments.get("group_id"):
-                return _err("Either 'recipient' or 'group_id' is required")
+                return _fail(name, "bad_request",
+                             "the request gave neither recipient nor group_id.")
             from datetime import datetime as _dt
             send_at_str = arguments["send_at"]
             send_at = None
@@ -2063,9 +2156,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 except ValueError:
                     continue
             if send_at is None:
-                return _err(f"Invalid send_at format: '{send_at_str}'. Use ISO datetime e.g. '2024-06-01T09:00:00'")
+                return _fail(name, "bad_request",
+                             f"'{send_at_str}' is not an ISO datetime such as "
+                             "2024-06-01T09:00:00.")
             if send_at <= _dt.now():
-                return _err("send_at must be in the future")
+                return _fail(name, "bad_request", "send_at is not in the future.")
             job_id = _store.add_scheduled_message(
                 message=arguments["message"],
                 send_at=send_at,
@@ -2081,23 +2176,43 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "cancel_scheduled_message":
             err = _require(arguments, "job_id")
             if err:
-                return _err(err)
+                return _fail(name, "bad_request", err)
             cancelled = _store.cancel_scheduled_message(int(arguments["job_id"]))
             if cancelled:
                 return _ok({"status": "cancelled", "job_id": arguments["job_id"]})
-            return _err(f"No pending scheduled message with id={arguments['job_id']}")
+            return _fail(name, "not_found",
+                         f"there is no pending scheduled message with id "
+                         f"{arguments['job_id']}.")
 
         elif name == "run_scheduled_messages":
             results = await client.process_scheduled_messages()
+            failed = [r for r in results if r.get("status") == "failed"]
+            if failed:
+                # A scheduled message that never went out is a failure, whatever the
+                # others did. The body carries every job so the sent ones stay visible.
+                return _fail(name, "send_failed",
+                             f"{len(failed)} of {len(results)} scheduled messages "
+                             "did not go out.",
+                             json.dumps(results, indent=2, default=str))
             return _ok({"processed": len(results), "results": results})
 
         else:
-            return _err(f"Unknown tool: {name}")
+            return _fail(name, "not_implemented",
+                         "this tool is advertised but has no handler in this server.")
 
-    except SignalError as e:
-        return _err(str(e))
+    except ToolFailure as e:
+        # Every named failure in this server (signal-cli, the keychain, sqlcipher,
+        # the local store, a bad argument) arrives here already carrying its code
+        # and the underlying words, so nothing is decided or reworded at this layer.
+        return _fail(name, e.code, e.detail, e.body, e.http)
+    except sqlite3.Error as e:
+        return _fail(name, envelope.sqlite_code(e),
+                     "the local Signal message store could not be read.",
+                     f"{type(e).__name__}: {e}")
     except Exception as e:
-        return _err(f"Unexpected error: {e}")
+        return _fail(name, "unexpected_error",
+                     f"the Signal connector hit a {type(e).__name__} it has no name for.",
+                     traceback.format_exc())
 
 
 _SERVICE_WARNING = (
@@ -2127,8 +2242,13 @@ async def _freshen_store(client: SignalClient) -> str | None:
     _last_freshen_at = now   # stamp BEFORE the await — concurrent calls see it as in-flight
     try:
         await client.receive_messages(timeout=2)
-    except Exception:
-        pass  # service just started receiving, or daemon not ready — best effort
+    except SignalError as exc:
+        # A poll that failed is not an empty inbox. The only condition that may pass
+        # is another process already holding the receive: then the store is being fed
+        # by that process and reading it is the honest answer.
+        if ALREADY_RECEIVING in f"{exc.detail} {exc.body or ''}":
+            return _SERVICE_WARNING
+        raise
     return _SERVICE_WARNING
 
 
