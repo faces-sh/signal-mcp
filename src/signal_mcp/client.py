@@ -2,11 +2,13 @@
 
 import asyncio
 import itertools
+import json as _json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys as _sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ from .config import (
     ATTACHMENT_DIR,
     DAEMON_MESSAGES_LOG,
     DAEMON_PORT,
+    DAEMON_STDERR_LOG,
     DAEMON_URL,
     RECEIVE_LOCK_FILE,
     clear_daemon_pid,
@@ -25,13 +28,27 @@ from .config import (
     read_daemon_pid,
     save_daemon_pid,
 )
+from .envelope import ToolFailure
 from .models import Attachment, Contact, Group, GroupMember, Message, SendResult
 from . import store as _store
 
 
-class SignalError(Exception):
-    pass
+class SignalError(ToolFailure):
+    """Anything signal-cli refused, could not do, or could not be asked.
 
+    Carries the envelope code and signal-cli's own words (rule 5), which is why
+    nothing here rewrites, summarises or annotates what signal-cli said.
+    """
+
+    def __init__(self, detail: str, code: str = "signal_cli_failed",
+                 body: str | None = None, http: str | None = None):
+        super().__init__(detail, code=code, body=body, http=http)
+
+
+# signal-cli reports the phrase below when another process already holds the receive
+# lock. That is not a failure: the messages are being written to the store by whoever
+# holds it. One constant, read by both the tool handler and the store freshener.
+ALREADY_RECEIVING = "already being received"
 
 _rpc_id = itertools.count(1)
 
@@ -43,27 +60,68 @@ def _validate_e164(number: str) -> None:
     """Raise SignalError if number is not valid E.164 format."""
     if not _E164_RE.match(number):
         raise SignalError(
-            f"Invalid phone number '{number}' — must be E.164 format (e.g. +12125551234)"
+            f"'{number}' is not an E.164 phone number (e.g. +12125551234).",
+            code="bad_request",
         )
 
 
-_SIGNAL_ERROR_HINTS: list[tuple[str, str]] = [
-    ("untrusted identity", "The contact's device may have changed. Use trust_identity to resolve."),
-    ("unverified identity", "The contact's device may have changed. Use trust_identity to resolve."),
-    ("identity key mismatch", "Safety number changed. Use trust_identity to verify and continue."),
-    ("rate limit", "Signal rate limit reached — wait a minute before sending more messages."),
-    ("not a member", "You are not a member of this group. Use list_groups to verify group IDs."),
-    ("invalid number", "Phone number not registered on Signal. Verify with get_profile first."),
-    ("group not found", "Group ID not found. Use list_groups to get current group IDs."),
-]
+def _send_result_failures(payload) -> list[dict]:
+    """Return every non-SUCCESS per-recipient result anywhere inside a signal-cli payload.
+
+    signal-cli reports a refused recipient as a `results` entry with a `type` other than
+    SUCCESS (UNREGISTERED_FAILURE, IDENTITY_FAILURE, ...), sometimes inside a JSON-RPC
+    error's `data` and sometimes inside an otherwise-200 result. This reads that field;
+    it does not read the prose.
+    """
+    found: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            entries = node.get("results")
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get("type") not in (None, "SUCCESS"):
+                        found.append(entry)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return found
 
 
-def _enhance_error(msg: str) -> str:
-    lower = msg.lower()
-    for keyword, hint in _SIGNAL_ERROR_HINTS:
-        if keyword in lower:
-            return f"{msg}\n→ {hint}"
-    return msg
+def _read_daemon_stderr(limit: int = 4000) -> str:
+    """Return the tail of what the signal-cli daemon last printed to stderr."""
+    try:
+        return DAEMON_STDERR_LOG.read_text(errors="replace")[-limit:].strip()
+    except OSError as exc:
+        return f"(daemon stderr log unreadable: {type(exc).__name__}: {exc})"
+
+
+def _expect(result, kind: type, method: str) -> None:
+    """Fail if signal-cli answered with a shape we cannot read.
+
+    The old guards turned an unreadable answer into an empty list or dict, which
+    reads downstream as "you have no groups / no accounts / no contacts" (rule 6).
+    """
+    if not isinstance(result, kind):
+        raise SignalError(
+            f"signal-cli answered '{method}' with something this server cannot read.",
+            code="signal_cli_failed",
+            body=_json.dumps(result, indent=2, default=str),
+        )
+
+
+def _send_failure_code(failures: list[dict]) -> str:
+    """Map signal-cli's own per-recipient failure `type` field onto an envelope code."""
+    types = {f.get("type") for f in failures}
+    if types == {"UNREGISTERED_FAILURE"}:
+        return "no_such_recipient"
+    if types == {"IDENTITY_FAILURE"}:
+        return "untrusted_identity"
+    return "send_failed"
 
 
 class _RateLimiter:
@@ -167,26 +225,54 @@ class SignalClient:
                 clear_daemon_pid()
                 await asyncio.sleep(0.5)
 
-            proc = subprocess.Popen(
-                [
-                    "signal-cli", "-u", self.account,
-                    "daemon",
-                    "--http", f"localhost:{DAEMON_PORT}",
-                    "--no-receive-stdout",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # stderr goes to a log rather than /dev/null: when the daemon refuses to
+            # start, what it printed is the only evidence of why (rule 5).
+            try:
+                DAEMON_STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+                DAEMON_STDERR_LOG.write_text("")
+                with open(DAEMON_STDERR_LOG, "ab") as err_log:
+                    proc = subprocess.Popen(
+                        [
+                            "signal-cli", "-u", self.account,
+                            "daemon",
+                            "--http", f"localhost:{DAEMON_PORT}",
+                            "--no-receive-stdout",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=err_log,
+                    )
+            except FileNotFoundError as exc:
+                raise SignalError(
+                    "signal-cli is not installed or not on PATH.",
+                    code="not_installed",
+                    body=f"{type(exc).__name__}: {exc}",
+                ) from exc
+            except OSError as exc:
+                raise SignalError(
+                    "the signal-cli daemon could not be started.",
+                    code="daemon_unavailable",
+                    body=f"{type(exc).__name__}: {exc}",
+                ) from exc
             save_daemon_pid(proc.pid)
 
             for _ in range(20):
                 await asyncio.sleep(0.5)
                 if await self._daemon_alive():
                     return
+                exit_code = proc.poll()
+                if exit_code is not None:
+                    # It died rather than timed out. Report why now instead of
+                    # waiting out the remaining ten seconds on a dead process.
+                    raise SignalError(
+                        f"the signal-cli daemon exited with code {exit_code} on startup.",
+                        code="daemon_unavailable",
+                        body=_read_daemon_stderr(),
+                    )
 
             raise SignalError(
-                "signal-cli daemon failed to start within 10 seconds. "
-                "Try running manually: signal-mcp daemon"
+                "the signal-cli daemon did not answer within 10 seconds of starting.",
+                code="daemon_unavailable",
+                body=_read_daemon_stderr(),
             )
 
     async def stop_daemon(self) -> bool:
@@ -272,6 +358,7 @@ class SignalClient:
             payload["params"] = params
 
         async with self._rpc_sem:
+            last_connect_error: Exception | None = None
             for attempt in range(2):
                 try:
                     r = await self._http.post(
@@ -279,18 +366,69 @@ class SignalClient:
                     )
                     r.raise_for_status()
                     break
-                except httpx.ConnectError:
+                except httpx.ConnectError as exc:
+                    last_connect_error = exc
                     if attempt == 0:
                         # Daemon may have crashed — try to restart before the second attempt
                         await self.ensure_daemon()
+                except httpx.TimeoutException as exc:
+                    raise SignalError(
+                        f"signal-cli did not answer '{method}' within {timeout:g} seconds.",
+                        code="timeout",
+                        body=f"{type(exc).__name__}: {exc}",
+                    ) from exc
+                except httpx.HTTPStatusError as exc:
+                    # The one genuinely HTTP failure in this server, so it gets the
+                    # literal status line and an http_<status> code (rules 2 and 4).
+                    resp = exc.response
+                    raise SignalError(
+                        f"the signal-cli daemon rejected '{method}'.",
+                        code=f"http_{resp.status_code}",
+                        body=resp.text,
+                        http=f"HTTP {resp.status_code} {resp.reason_phrase}",
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    raise SignalError(
+                        f"the request to the signal-cli daemon for '{method}' failed.",
+                        code="daemon_unavailable",
+                        body=f"{type(exc).__name__}: {exc}",
+                    ) from exc
             else:
-                raise SignalError("signal-cli daemon not running. Run: signal-mcp daemon")
+                raise SignalError(
+                    "the signal-cli daemon is not accepting connections.",
+                    code="daemon_unavailable",
+                    body=(f"{type(last_connect_error).__name__}: {last_connect_error}"
+                          if last_connect_error else None),
+                )
 
-        body = r.json()
+        try:
+            body = r.json()
+        except ValueError as exc:
+            raise SignalError(
+                f"the signal-cli daemon's answer to '{method}' was not JSON.",
+                code="signal_cli_failed",
+                body=r.text,
+            ) from exc
+
         if "error" in body:
-            raw = body["error"].get("message", str(body["error"]))
-            raise SignalError(f"signal-cli error: {_enhance_error(raw)}")
-        return body.get("result", {})
+            failures = _send_result_failures(body["error"])
+            raise SignalError(
+                f"signal-cli reported an error for '{method}'.",
+                code=_send_failure_code(failures) if failures else "signal_cli_failed",
+                body=_json.dumps(body["error"], indent=2, default=str),
+            )
+
+        result = body.get("result", {})
+        # A 200 can still carry per-recipient refusals. Reporting that as "sent" is the
+        # difference between "delivered" and "that number is not on Signal" (rule 6).
+        failures = _send_result_failures(result)
+        if failures:
+            raise SignalError(
+                f"signal-cli could not deliver to every recipient of '{method}'.",
+                code=_send_failure_code(failures),
+                body=_json.dumps(result, indent=2, default=str),
+            )
+        return result
 
     # ── Messaging ─────────────────────────────────────────────────────────────
 
@@ -470,9 +608,16 @@ class SignalClient:
         # Resolve to prevent path traversal (e.g. "../secret")
         path = (att_dir / filename).resolve()
         if path.parent != att_dir.resolve():
-            raise SignalError(f"Invalid attachment filename: {filename}")
+            raise SignalError(
+                f"'{filename}' is not a name inside the Signal attachments folder.",
+                code="bad_request",
+            )
         if not path.exists() or not path.is_file():
-            raise SignalError(f"Attachment not found: {filename}")
+            raise SignalError(
+                f"there is no downloaded attachment named '{filename}'.",
+                code="not_found",
+                body=f"Looked in: {att_dir}",
+            )
         stat = path.stat()
         return {
             "filename": path.name,
@@ -511,8 +656,9 @@ class SignalClient:
     async def receive_messages(self, timeout: int = 5) -> list[Message]:
         """Poll for new messages and persist them to local store."""
         result = await self._rpc("receive", {"timeout": timeout}, timeout=timeout + 5.0)
+        _expect(result, list, "receive")
         messages = []
-        for envelope in result if isinstance(result, list) else []:
+        for envelope in result:
             # Intercept incoming edits: update existing message body rather than saving a new ghost
             data = envelope.get("envelope", envelope)
             edit_sender = data.get("source", "") or data.get("sourceNumber", "")
@@ -546,37 +692,59 @@ class SignalClient:
         invokes ``signal-cli receive`` as a subprocess.  A lockfile prevents
         other processes from restarting the daemon during the receive window.
         """
-        import json as _json
-
         RECEIVE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         RECEIVE_LOCK_FILE.write_text(str(os.getpid()))
         try:
             await self.stop_daemon()
             await asyncio.sleep(0.5)
 
-            proc = await asyncio.create_subprocess_exec(
-                "signal-cli", "-u", self.account, "-o", "json",
-                "receive", "--timeout", str(timeout),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "signal-cli", "-u", self.account, "-o", "json",
+                    "receive", "--timeout", str(timeout),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError as exc:
+                raise SignalError(
+                    "signal-cli is not installed or not on PATH.",
+                    code="not_installed",
+                    body=f"{type(exc).__name__}: {exc}",
+                ) from exc
+            stdout, stderr = await proc.communicate()
         finally:
             RECEIVE_LOCK_FILE.unlink(missing_ok=True)
 
+        # A non-zero signal-cli is not "no new messages": an empty list here would read
+        # as an empty inbox to whoever asked (rule 6).
+        if proc.returncode != 0:
+            raise SignalError(
+                f"signal-cli receive exited with code {proc.returncode}.",
+                code="signal_cli_failed",
+                body=stderr.decode(errors="replace").strip(),
+            )
+
         messages: list[Message] = []
+        undecodable: list[str] = []
         for line in stdout.decode().strip().splitlines():
             if not line.strip():
                 continue
             try:
                 envelope = _json.loads(line)
             except _json.JSONDecodeError:
+                undecodable.append(line)
                 continue
             msg = self._parse_envelope(envelope)
             if msg:
                 if not msg.receipt_type:
                     await asyncio.to_thread(_store.save_message, msg)
                 messages.append(msg)
+        if undecodable and not messages:
+            raise SignalError(
+                "signal-cli receive printed nothing this server could read as a message.",
+                code="signal_cli_failed",
+                body="\n".join(undecodable),
+            )
         return messages
 
     def _parse_envelope(self, envelope: dict) -> Message | None:
@@ -652,13 +820,19 @@ class SignalClient:
         attachments = []
         for att in data_message.get("attachments", []):
             local_path = att.get("filename")
+            caption = att.get("caption")
             if local_path:
                 dest = ensure_attachment_dir() / Path(local_path).name
                 try:
                     shutil.copy2(local_path, dest)
                     local_path = str(dest)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    # The message itself is fine, so this must not fail the whole receive.
+                    # But a path we could not copy is not a path anyone can open later:
+                    # say so on the attachment rather than handing back a dead one.
+                    local_path = None
+                    note = f"[attachment not saved locally: {type(exc).__name__}: {exc}]"
+                    caption = f"{caption} {note}" if caption else note
             attachments.append(Attachment(
                 content_type=att.get("contentType", "application/octet-stream"),
                 filename=att.get("filename", ""),
@@ -666,7 +840,7 @@ class SignalClient:
                 size=att.get("size"),
                 width=att.get("width"),
                 height=att.get("height"),
-                caption=att.get("caption"),
+                caption=caption,
             ))
         return attachments
 
@@ -693,8 +867,11 @@ class SignalClient:
                     _contact_cache[c.uuid] = c.display_name
             _contact_cache_loaded = True   # only set on success
             _contact_cache_at = time.monotonic()
-        except Exception:
-            pass  # will retry on next call
+        except SignalError:
+            # Names are enrichment on top of an answer, never the answer, so a cold
+            # daemon must not fail the caller's read. Narrow to SignalError so a bug
+            # in here is not swallowed with it; the cache retries on the next call.
+            pass
 
     async def _ensure_group_cache(self) -> None:
         """Load group names into module-level cache (TTL same as contact cache)."""
@@ -709,8 +886,8 @@ class SignalClient:
                     _group_cache[g.id] = g.name or g.id
             _group_cache_loaded = True
             _group_cache_at = time.monotonic()
-        except Exception:
-            pass
+        except SignalError:
+            pass  # same as the contact cache: enrichment, retried next call
 
     async def _ensure_caches(self) -> None:
         """Load contact and group name caches concurrently (parallel RPC calls)."""
@@ -741,8 +918,9 @@ class SignalClient:
 
     async def list_contacts(self, search: str | None = None) -> list[Contact]:
         result = await self._rpc("listContacts")
+        _expect(result, list, "listContacts")
         contacts = []
-        for c in result if isinstance(result, list) else []:
+        for c in result:
             profile = c.get("profile") or {}
             contacts.append(Contact(
                 number=c.get("number") or "",
@@ -811,8 +989,9 @@ class SignalClient:
 
     async def list_groups(self) -> list[Group]:
         result = await self._rpc("listGroups")
+        _expect(result, list, "listGroups")
         groups = []
-        for g in result if isinstance(result, list) else []:
+        for g in result:
             members = [
                 GroupMember(
                     uuid=m.get("uuid", ""),
@@ -846,7 +1025,8 @@ class SignalClient:
         if description:
             params["description"] = description
         result = await self._rpc("updateGroup", params)
-        return result if isinstance(result, dict) else {}
+        _expect(result, dict, "updateGroup")
+        return result
 
     async def update_group(
         self,
@@ -884,7 +1064,8 @@ class SignalClient:
     async def join_group(self, uri: str) -> dict:
         """Join a group via invite link URI."""
         result = await self._rpc("joinGroup", {"uri": uri})
-        return result if isinstance(result, dict) else {}
+        _expect(result, dict, "joinGroup")
+        return result
 
     async def list_devices(self) -> list[dict]:
         """List all linked devices on this account."""
@@ -962,7 +1143,8 @@ class SignalClient:
     async def get_user_status(self, recipients: list[str]) -> list[dict]:
         """Check whether phone numbers are registered Signal users."""
         result = await self._rpc("getUserStatus", {"recipients": recipients})
-        return result if isinstance(result, list) else []
+        _expect(result, list, "getUserStatus")
+        return result
 
     async def send_sync_request(self) -> None:
         """Request a sync of messages/contacts/groups from the primary device."""
@@ -973,7 +1155,8 @@ class SignalClient:
     async def get_configuration(self) -> dict:
         """Return current Signal account configuration flags."""
         result = await self._rpc("getConfiguration")
-        return result if isinstance(result, dict) else {}
+        _expect(result, dict, "getConfiguration")
+        return result
 
     async def update_configuration(
         self,
@@ -1000,7 +1183,8 @@ class SignalClient:
     async def list_sticker_packs(self) -> list[dict]:
         """List all installed sticker packs."""
         result = await self._rpc("listStickerPacks")
-        return result if isinstance(result, list) else []
+        _expect(result, list, "listStickerPacks")
+        return result
 
     async def add_sticker_pack(self, uri: str) -> None:
         """Install a sticker pack from a signal.art URL."""
@@ -1009,9 +1193,14 @@ class SignalClient:
     async def get_sticker(self, pack_id: str, sticker_id: int) -> str:
         """Get a single sticker image as a base64-encoded string."""
         result = await self._rpc("getSticker", {"packId": pack_id, "stickerId": sticker_id})
-        if isinstance(result, dict):
-            return result.get("base64", "") or ""
-        return str(result) if result else ""
+        data = result.get("base64") if isinstance(result, dict) else result
+        if not data:
+            raise SignalError(
+                f"signal-cli returned no image for sticker {pack_id}:{sticker_id}.",
+                code="signal_cli_failed",
+                body=_json.dumps(result, indent=2, default=str),
+            )
+        return str(data)
 
     async def upload_sticker_pack(self, path: str) -> str:
         """Upload a sticker pack from a local manifest.json or zip file.
@@ -1020,16 +1209,20 @@ class SignalClient:
         """
         resolved = str(Path(path).expanduser().resolve())
         result = await self._rpc("uploadStickerPack", {"path": resolved})
-        if isinstance(result, dict):
-            return result.get("url", "") or str(result)
-        return str(result) if result else ""
+        url = result.get("url") if isinstance(result, dict) else result
+        if not url:
+            raise SignalError(
+                "signal-cli returned no signal.art URL for the uploaded sticker pack.",
+                code="signal_cli_failed",
+                body=_json.dumps(result, indent=2, default=str),
+            )
+        return str(url)
 
     async def list_accounts(self) -> list[str]:
         """List all phone numbers (accounts) configured in signal-cli."""
         result = await self._rpc("listAccounts")
-        if isinstance(result, list):
-            return [entry.get("number") or entry for entry in result if entry]
-        return []
+        _expect(result, list, "listAccounts")
+        return [entry.get("number") or entry for entry in result if entry]
 
     async def update_account(
         self,
@@ -1075,7 +1268,11 @@ class SignalClient:
                     yield msg
             except asyncio.CancelledError:
                 return
-            except Exception:
+            except Exception as exc:
+                # The watch loop must survive a flaky daemon, but a poll that keeps
+                # failing has to be visible somewhere rather than looking like silence.
+                print(f"[signal-mcp] receive poll failed: {type(exc).__name__}: {exc}",
+                      file=_sys.stderr, flush=True)
                 await asyncio.sleep(poll_interval)
 
     # ── Message actions ───────────────────────────────────────────────────────

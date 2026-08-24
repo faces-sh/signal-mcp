@@ -288,7 +288,9 @@ async def test_ensure_contact_cache_populates(client):
 @pytest.mark.asyncio
 async def test_ensure_group_cache_failure_leaves_unloaded(client):
     with patch.object(client, "list_groups", new_callable=AsyncMock,
-                      side_effect=Exception("daemon down")):
+                      side_effect=client_mod.SignalError("the signal-cli daemon is not "
+                                                         "accepting connections.",
+                                                         code="daemon_unavailable")):
         await client._ensure_group_cache()
     assert client_mod._group_cache_loaded is False
 
@@ -444,9 +446,11 @@ async def test_upload_sticker_pack_string_result(client, tmp_path):
 @respx.mock
 @pytest.mark.asyncio
 async def test_list_accounts_non_list(client):
+    """An unreadable answer is a failure, never an empty account list (rule 6)."""
     respx.post(DAEMON_URL).mock(return_value=httpx.Response(200, json=rpc_ok(None)))
-    result = await client.list_accounts()
-    assert result == []
+    with pytest.raises(client_mod.SignalError) as exc_info:
+        await client.list_accounts()
+    assert exc_info.value.code == "signal_cli_failed"
 
 
 # ── update_account with unrestricted_unidentified_sender ─────────────────────
@@ -748,9 +752,11 @@ async def test_ensure_daemon_timeout_raises(client, monkeypatch):
 
     proc_mock = MagicMock()
     proc_mock.pid = 99996
+    proc_mock.poll.return_value = None   # still running, just never answering
     with patch("signal_mcp.client.subprocess.Popen", return_value=proc_mock):
-        with pytest.raises(SignalError, match="daemon failed to start"):
+        with pytest.raises(SignalError) as exc_info:
             await client.ensure_daemon()
+    assert exc_info.value.code == "daemon_unavailable"
 
 
 # ── stop_daemon ────────────────────────────────────────────────────────────────

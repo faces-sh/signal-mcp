@@ -94,27 +94,31 @@ def test_detect_account_subprocess_plus_line(monkeypatch, tmp_path):
 
 
 def test_detect_account_subprocess_nonzero_exit(monkeypatch, tmp_path):
-    """Non-zero exit from signal-cli raises RuntimeError."""
+    """Non-zero exit carries signal_cli_failed and signal-cli's own stderr."""
     monkeypatch.setattr(config_mod, "_ACCOUNTS_JSON", tmp_path / "nonexistent.json")
     mock_result = MagicMock()
     mock_result.returncode = 1
     mock_result.stdout = ""
     mock_result.stderr = "some error"
     with patch("signal_mcp.config.subprocess.run", return_value=mock_result):
-        with pytest.raises(RuntimeError, match="listAccounts failed"):
+        with pytest.raises(RuntimeError) as exc_info:
             detect_account()
+    assert exc_info.value.code == "signal_cli_failed"
+    assert exc_info.value.body == "some error"
 
 
-def test_detect_account_subprocess_no_matching_line(monkeypatch, tmp_path):
-    """Zero exit but no parseable account line raises RuntimeError."""
+def test_detect_account_not_linked(monkeypatch, tmp_path):
+    """Zero exit with no account line is not_linked, not a generic RuntimeError."""
     monkeypatch.setattr(config_mod, "_ACCOUNTS_JSON", tmp_path / "nonexistent.json")
     mock_result = MagicMock()
     mock_result.returncode = 0
     mock_result.stdout = "No accounts configured.\n"
     mock_result.stderr = ""
     with patch("signal_mcp.config.subprocess.run", return_value=mock_result):
-        with pytest.raises(RuntimeError, match="No Signal account found"):
+        with pytest.raises(RuntimeError) as exc_info:
             detect_account()
+    assert exc_info.value.code == "not_linked"
+    assert "No accounts configured." in exc_info.value.body
 
 
 # ── check_signal_cli_version ──────────────────────────────────────────────────
@@ -134,20 +138,23 @@ def test_check_signal_cli_version_too_old():
     mock_result.stdout = "signal-cli 0.12.0\n"
     mock_result.stderr = ""
     with patch("signal_mcp.config.subprocess.run", return_value=mock_result):
-        with pytest.raises(RuntimeError, match="too old"):
+        with pytest.raises(RuntimeError) as exc_info:
             check_signal_cli_version()
+    assert exc_info.value.code == "signal_cli_too_old"
 
 
 def test_check_signal_cli_version_not_found():
     with patch("signal_mcp.config.subprocess.run", side_effect=FileNotFoundError()):
-        with pytest.raises(RuntimeError, match="not found"):
+        with pytest.raises(RuntimeError) as exc_info:
             check_signal_cli_version()
+    assert exc_info.value.code == "not_installed"
 
 
 def test_check_signal_cli_version_timeout():
     with patch("signal_mcp.config.subprocess.run", side_effect=subprocess.TimeoutExpired("signal-cli", 10)):
-        with pytest.raises(RuntimeError, match="timed out"):
+        with pytest.raises(RuntimeError) as exc_info:
             check_signal_cli_version()
+    assert exc_info.value.code == "timeout"
 
 
 def test_check_signal_cli_version_nonzero_exit():
@@ -156,8 +163,10 @@ def test_check_signal_cli_version_nonzero_exit():
     mock_result.stdout = ""
     mock_result.stderr = "crashed"
     with patch("signal_mcp.config.subprocess.run", return_value=mock_result):
-        with pytest.raises(RuntimeError, match="exited with code"):
+        with pytest.raises(RuntimeError) as exc_info:
             check_signal_cli_version()
+    assert exc_info.value.code == "signal_cli_failed"
+    assert exc_info.value.body == "crashed"
 
 
 def test_check_signal_cli_version_unparseable():
@@ -166,8 +175,10 @@ def test_check_signal_cli_version_unparseable():
     mock_result.stdout = "no version here\n"
     mock_result.stderr = ""
     with patch("signal_mcp.config.subprocess.run", return_value=mock_result):
-        with pytest.raises(RuntimeError, match="Could not parse"):
+        with pytest.raises(RuntimeError) as exc_info:
             check_signal_cli_version()
+    assert exc_info.value.code == "signal_cli_failed"
+    assert exc_info.value.body == "no version here"
 
 
 # ── save_daemon_pid / read_daemon_pid / clear_daemon_pid ──────────────────────

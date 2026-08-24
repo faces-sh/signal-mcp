@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests import envelope_helpers as _envelope
 from signal_mcp.desktop import (
     DesktopImportError,
     _decode_group_id,
@@ -38,8 +39,9 @@ def test_decode_group_id_valid():
 
 def test_decrypt_key_unknown_format():
     bad_hex = bytes(b"v99" + b"\x00" * 16).hex()
-    with pytest.raises(DesktopImportError, match="Unknown encryptedKey format"):
+    with pytest.raises(DesktopImportError) as exc_info:
         _decrypt_key(bad_hex, b"password")
+    assert exc_info.value.code == "db_decrypt_failed"
 
 
 # ── DB parsing test ─────────────────────────────────────────────────────────────
@@ -202,8 +204,9 @@ def test_import_from_desktop_no_db(tmp_path):
     original_db = _desktop_module.SIGNAL_DB
     _desktop_module.SIGNAL_DB = tmp_path / "nonexistent.db"
 
-    with pytest.raises(DesktopImportError, match="not found"):
+    with pytest.raises(DesktopImportError) as exc_info:
         import_from_desktop()
+    assert exc_info.value.code == "db_missing"
 
     _desktop_module.SIGNAL_DB = original_db
 
@@ -388,16 +391,18 @@ def test_get_keychain_password_windows_raises():
     """Windows path in _get_keychain_password raises DesktopImportError."""
     from signal_mcp.desktop import _get_keychain_password, DesktopImportError
     with patch("signal_mcp.desktop.platform.system", return_value="Windows"):
-        with pytest.raises(DesktopImportError, match="decrypt_dpapi_key"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _get_keychain_password()
+    assert exc_info.value.code == "unsupported_platform"
 
 
 def test_get_keychain_password_unknown_platform():
     """Unknown platform raises DesktopImportError."""
     from signal_mcp.desktop import _get_keychain_password, DesktopImportError
     with patch("signal_mcp.desktop.platform.system", return_value="Haiku"):
-        with pytest.raises(DesktopImportError, match="not supported"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _get_keychain_password()
+    assert exc_info.value.code == "unsupported_platform"
 
 
 def test_decrypt_dpapi_key_strips_v10_prefix():
@@ -416,8 +421,9 @@ def test_decrypt_dpapi_key_dpapi_fails():
     mock_windll = MagicMock()
     mock_windll.crypt32.CryptUnprotectData.return_value = 0  # DPAPI says no
     with patch.object(_ctypes, "windll", mock_windll, create=True):
-        with pytest.raises(DesktopImportError, match="DPAPI decryption failed"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _decrypt_dpapi_key((b"v10" + b"\x00" * 16).hex())
+    assert exc_info.value.code == "db_decrypt_failed"
 
 
 def test_decrypt_dpapi_key_dpapi_success():
@@ -488,8 +494,9 @@ def test_find_sqlcipher_not_found():
     which_result.stdout = ""
     with patch("signal_mcp.desktop.Path.exists", return_value=False), \
          patch("signal_mcp.desktop.subprocess.run", return_value=which_result):
-        with pytest.raises(DesktopImportError, match="sqlcipher not found"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _find_sqlcipher()
+    assert exc_info.value.code == "not_installed"
 
 
 def test_decrypt_db_to_temp_success(tmp_path):
@@ -531,10 +538,13 @@ def test_decrypt_db_to_temp_sqlcipher_fails(tmp_path):
     fail_result = MagicMock()
     fail_result.returncode = 1
     fail_result.stderr = "cipher error"
+    fail_result.stdout = ""
     with patch("signal_mcp.desktop._find_sqlcipher", return_value="/usr/bin/sqlcipher"), \
          patch("signal_mcp.desktop.subprocess.run", return_value=fail_result):
-        with pytest.raises(DesktopImportError, match="sqlcipher failed"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _decrypt_db_to_temp("aabbccdd" * 8, fake_db)
+    assert exc_info.value.code == "db_decrypt_failed"
+    assert exc_info.value.body == "cipher error"
 
 
 def test_decrypt_db_to_temp_empty_output(tmp_path):
@@ -547,11 +557,13 @@ def test_decrypt_db_to_temp_empty_output(tmp_path):
     ok_result = MagicMock()
     ok_result.returncode = 0
     ok_result.stderr = ""
+    ok_result.stdout = ""
     # Don't create the temp file → empty output condition
     with patch("signal_mcp.desktop._find_sqlcipher", return_value="/usr/bin/sqlcipher"), \
          patch("signal_mcp.desktop.subprocess.run", return_value=ok_result):
-        with pytest.raises(DesktopImportError, match="empty output"):
+        with pytest.raises(DesktopImportError) as exc_info:
             _decrypt_db_to_temp("aabbccdd" * 8, fake_db)
+    assert exc_info.value.code == "db_decrypt_failed"
 
 
 def test_read_messages_skips_zero_timestamp(tmp_path):
@@ -617,8 +629,9 @@ def test_import_config_missing(tmp_path):
     (signal_dir / "sql").mkdir(parents=True)
     (signal_dir / "sql" / "db.sqlite").write_bytes(b"fake")
     # config.json intentionally not created
-    with pytest.raises(DesktopImportError, match="config not found"):
+    with pytest.raises(DesktopImportError) as exc_info:
         import_from_desktop(signal_dir=signal_dir)
+    assert exc_info.value.code == "config_missing"
 
 
 def test_import_no_encrypted_key(tmp_path):
@@ -628,8 +641,9 @@ def test_import_no_encrypted_key(tmp_path):
     (signal_dir / "sql").mkdir(parents=True)
     (signal_dir / "sql" / "db.sqlite").write_bytes(b"fake")
     (signal_dir / "config.json").write_text(json.dumps({"someOtherKey": "value"}))
-    with pytest.raises(DesktopImportError, match="No encryptedKey"):
+    with pytest.raises(DesktopImportError) as exc_info:
         import_from_desktop(signal_dir=signal_dir)
+    assert exc_info.value.code == "config_unreadable"
 
 
 def test_import_progress_callbacks(tmp_path):
@@ -708,27 +722,29 @@ def test_import_progress_other_platform(tmp_path):
 
 
 def test_import_detect_account_failure(tmp_path):
-    """import_from_desktop uses empty own_number when detect_account raises."""
+    """An unknown own number stops the import instead of filing history under "me"."""
     signal_dir = _make_signal_dir(tmp_path)
 
+    from signal_mcp.config import NotLinked
     from signal_mcp.desktop import import_from_desktop
     from signal_mcp.models import Message
     fake_plain = tmp_path / "plain_acct.db"
     fake_plain.write_bytes(b"x")
     msg = Message(id="a1", sender="+1", body="hi", timestamp=datetime(2024, 1, 1))
 
+    not_linked = NotLinked("no Signal account is linked to signal-cli on this machine.",
+                           code="not_linked", body="No accounts configured.")
     with patch("signal_mcp.desktop._get_db_key_hex", return_value="aa" * 32), \
          patch("signal_mcp.desktop._decrypt_db_to_temp", return_value=fake_plain), \
-         patch("signal_mcp.desktop._read_messages_from_plain_db", return_value=[msg]) as mock_read, \
+         patch("signal_mcp.desktop._read_messages_from_plain_db", return_value=[msg]), \
          patch("signal_mcp.desktop._store") as mock_store, \
-         patch("signal_mcp.desktop.detect_account", side_effect=RuntimeError("no account")):
+         patch("signal_mcp.desktop.detect_account", side_effect=not_linked):
         mock_store.save_message.return_value = True
-        result = import_from_desktop(signal_dir=signal_dir)
+        with pytest.raises(DesktopImportError) as exc_info:
+            import_from_desktop(signal_dir=signal_dir)
 
-    # Should succeed with own_number="" (outgoing messages attributed to "me")
-    assert result["total"] == 1
-    # _read_messages_from_plain_db called with own_number=""
-    mock_read.assert_called_once_with(fake_plain, own_number="", since_ms=0)
+    assert exc_info.value.code == "not_linked"
+    assert exc_info.value.body == "No accounts configured."
 
 
 def test_import_skipped_count(tmp_path):
@@ -984,11 +1000,15 @@ async def test_server_sync_desktop_error(tmp_path):
 
     fake_client = MagicMock(spec=SignalClient)
     fake_client.account = "+49test"
-    with patch("signal_mcp.desktop.sync_from_desktop", side_effect=DesktopImportError("no sqlcipher")), \
+    with patch("signal_mcp.desktop.sync_from_desktop",
+               side_effect=DesktopImportError("no sqlcipher is installed.",
+                                              code="not_installed")), \
          patch.object(server_mod, "_client", fake_client):
         result = await server_mod.call_tool("sync_desktop", {})
 
-    assert "no sqlcipher" in result[0].text
+    code, text = _envelope.failure(result)
+    assert code == "not_installed"
+    assert "no sqlcipher" in text
 
 
 # ── CLI sync-desktop ──────────────────────────────────────────────────────────
