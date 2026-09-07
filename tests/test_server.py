@@ -171,7 +171,7 @@ async def test_call_tool_unexpected_exception_returns_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tool_list_conversations_empty():
+async def test_tool_list_conversations_empty(desktop):
     result = await call_tool("list_conversations", {})
     assert "[]" in result[0].text
 
@@ -450,14 +450,10 @@ async def test_tool_receive_delivery_receipt():
 
 
 @pytest.mark.asyncio
-async def test_tool_get_conversation_pagination():
-    from signal_mcp.models import Message
-    from datetime import datetime
+async def test_tool_get_conversation_pagination(desktop):
+    conv = desktop.contact("+2")
     for i in range(5):
-        _store_mod.save_message(Message(
-            id=f"msg{i}", sender="+2", body=f"msg {i}",
-            timestamp=datetime(2024, 1, 1, 0, 0, i),
-        ))
+        desktop.message(conv, f"msg {i}")
     result_all = await call_tool("get_conversation", {"recipient": "+2", "limit": 5})
     result_page = await call_tool("get_conversation", {"recipient": "+2", "limit": 3, "offset": 0})
     result_next = await call_tool("get_conversation", {"recipient": "+2", "limit": 3, "offset": 3})
@@ -562,16 +558,13 @@ async def test_get_conversation_auto_marks_read():
 
 
 @pytest.mark.asyncio
-async def test_get_conversation_enriches_sender_name(monkeypatch):
+async def test_get_conversation_enriches_sender_name(monkeypatch, desktop):
     """get_conversation response includes sender_name field."""
     import signal_mcp.client as _client_mod
     monkeypatch.setattr(_client_mod, "_contact_cache", {"+19999999999": "Alice"})
     monkeypatch.setattr(_client_mod, "_contact_cache_loaded", True)
-    _store_mod.init_db()
-    _store_mod.save_message(Message(
-        id="msg_alice", sender="+19999999999", body="hi",
-        timestamp=datetime(2024, 1, 1),
-    ))
+    conv = desktop.contact("+19999999999")
+    desktop.message(conv, "hi")
     result = await call_tool("get_conversation", {"recipient": "+19999999999"})
     data = json.loads(result[0].text)
     assert data["messages"][0]["sender_name"] == "Alice"
@@ -681,14 +674,10 @@ async def test_tool_delete_local_messages():
 # ── has_more / total in get_conversation ──────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_conversation_returns_pagination_metadata():
-    from datetime import datetime as _dt
-    _store_mod.init_db()
+async def test_get_conversation_returns_pagination_metadata(desktop):
+    conv = desktop.contact("+19999999999")
     for i in range(5):
-        _store_mod.save_message(Message(
-            id=f"pg{i}", sender="+19999999999", body=f"msg{i}",
-            timestamp=_dt(2024, 1, i + 1),
-        ))
+        desktop.message(conv, f"msg{i}")
     result = await call_tool("get_conversation", {"recipient": "+19999999999", "limit": 3})
     data = json.loads(result[0].text)
     assert "messages" in data
@@ -699,14 +688,10 @@ async def test_get_conversation_returns_pagination_metadata():
 
 
 @pytest.mark.asyncio
-async def test_get_conversation_has_more_false_when_all_returned():
-    from datetime import datetime as _dt
-    _store_mod.init_db()
+async def test_get_conversation_has_more_false_when_all_returned(desktop):
+    conv = desktop.contact("+19999999999")
     for i in range(3):
-        _store_mod.save_message(Message(
-            id=f"all{i}", sender="+19999999999", body=f"msg{i}",
-            timestamp=_dt(2024, 1, i + 1),
-        ))
+        desktop.message(conv, f"msg{i}")
     result = await call_tool("get_conversation", {"recipient": "+19999999999"})
     data = json.loads(result[0].text)
     assert data["total"] == 3
@@ -727,11 +712,9 @@ async def test_tool_send_message_invalid_number():
 # ── search_messages with sender filter ────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_tool_search_messages_sender_filter():
-    from datetime import datetime as _dt
-    _store_mod.init_db()
-    _store_mod.save_message(Message(id="s1", sender="+11111111111", body="hello from 1", timestamp=_dt(2024, 1, 1)))
-    _store_mod.save_message(Message(id="s2", sender="+12222222222", body="hello from 2", timestamp=_dt(2024, 1, 2)))
+async def test_tool_search_messages_sender_filter(desktop):
+    desktop.message(desktop.contact("+11111111111"), "hello from 1")
+    desktop.message(desktop.contact("+12222222222"), "hello from 2")
     result = await call_tool("search_messages", {"query": "hello", "sender": "+11111111111"})
     data = json.loads(result[0].text)
     assert len(data) == 1
@@ -1549,8 +1532,15 @@ async def test_get_unread_has_more_false_when_exact_limit():
 # Bug 5: dead mark_as_read block in get_conversation — verify no double-marking
 @respx.mock
 @pytest.mark.asyncio
-async def test_get_conversation_marks_incoming_as_read():
-    """get_conversation must mark incoming messages as read exactly once."""
+async def test_get_conversation_marks_incoming_as_read(desktop):
+    """Reading a conversation marks it read, as it does in every Signal client.
+
+    TWO STORES, ONE MESSAGE, which is the real situation: the daemon received it (so it is unread and
+    counted on the badge) and Signal Desktop has it too (so it is history to read). History is read from
+    Desktop now, and those rows carry their own ids, so the badge cannot be cleared by handing an id
+    back: the rows are found by conversation, the way the badge finds them.
+    """
+    desktop.message(desktop.contact("+12223334444"), "hello conv")
     _store_mod.init_db()
     _store_mod.save_message(Message(
         id="cv_in1", sender="+12223334444", body="hello conv",

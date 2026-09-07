@@ -33,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import desktop
+from .envelope import sqlite_code as _sqlite_code
 from .models import Message
 
 log = logging.getLogger(__name__)
@@ -67,6 +68,25 @@ def _fingerprint() -> tuple[int, int]:
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def _require_desktop() -> None:
+    """Say plainly that history lives in Signal Desktop, rather than answering with an empty room.
+
+    signal-cli only ever sees what arrives while it is running, and records no conversation for anything
+    sent from another device, so there is no honest fallback: a private copy answers a two-sided
+    conversation with one side of it and nothing says so. An empty conversation reads as silence from
+    somebody who has in fact been writing, which is the one failure nobody can see.
+    """
+    if available():
+        return
+    raise desktop.DesktopImportError(
+        "Signal Desktop is not installed on this Mac, so there is no message history to read.",
+        code="desktop_missing",
+        body="Signal history is read from Signal Desktop's own database. signal-cli sees only messages "
+             "that arrive while it is running, and none of the ones you send from another device. "
+             "Install Signal Desktop from https://signal.org/download/ and open it once.",
+    )
+
+
 def _plain_db() -> Path:
     """A readable copy of Signal Desktop's database, decrypting only when it has changed.
 
@@ -75,6 +95,7 @@ def _plain_db() -> Path:
     burst costs one decryption and a genuinely new message costs another.
     """
     global _cached
+    _require_desktop()
     with _lock:
         now = _fingerprint()
         if _cached is not None:
@@ -94,6 +115,23 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_plain_db()))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+class DesktopReadError(desktop.DesktopImportError):
+    """Reading the history failed, which is NOT the same fact as the history being empty.
+
+    "I could not read your messages" coming back as "no messages" is the one failure nobody can see: it
+    reads as silence from a person who has been writing. Every sqlite failure here carries the database's
+    own reason (`SQLITE_BUSY` becomes `db_locked`), the same mapping the import path already uses.
+    """
+
+
+def _reading(what, exc):
+    return DesktopReadError(
+        f"Signal Desktop's message history could not be read while trying to {what}.",
+        code=_sqlite_code(exc),
+        body=f"{type(exc).__name__}: {exc}",
+    )
 
 
 def _identifiers(row: sqlite3.Row) -> list[str]:
@@ -177,6 +215,13 @@ def get_conversation(
     own_number: str = "",
 ) -> list[Message]:
     """Message history with one contact or group, oldest last, both sides of it."""
+    try:
+        return _get_conversation(recipient, limit, offset, since, own_number)
+    except sqlite3.Error as exc:
+        raise _reading("read that conversation", exc) from exc
+
+
+def _get_conversation(recipient, limit, offset, since, own_number):
     conv = _conversation_for(recipient)
     if conv is None:
         return []
@@ -196,10 +241,39 @@ def get_conversation(
     return [m for m in out if m]
 
 
+def count_conversation(recipient: str, since: datetime | None = None) -> int:
+    """How many messages the conversation holds, for the caller's pagination.
+
+    Counted with the SAME `IS_WRITING` test the read uses. Counting rows the read would discard is how
+    `has_more` promises a next page that does not exist.
+    """
+    try:
+        conv = _conversation_for(recipient)
+        if conv is None:
+            return 0
+        clauses, params = ["conversationId = ?", IS_WRITING], [conv["id"]]
+        if since:
+            clauses.append("COALESCE(sent_at, received_at, 0) >= ?")
+            params.append(int(since.timestamp() * 1000))
+        with _connect() as conn:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(clauses)}", params
+            ).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise _reading("count that conversation", exc) from exc
+
+
 def search_messages(
     query: str, limit: int = 50, offset: int = 0, sender: str | None = None, own_number: str = "",
 ) -> list[Message]:
     """Messages whose body matches, across every conversation."""
+    try:
+        return _search_messages(query, limit, offset, sender, own_number)
+    except sqlite3.Error as exc:
+        raise _reading("search your messages", exc) from exc
+
+
+def _search_messages(query, limit, offset, sender, own_number):
     wanted = (query or "").strip()
     if not wanted:
         return []
@@ -224,6 +298,13 @@ def search_messages(
 
 def list_conversations(own_number: str = "") -> list[dict]:
     """Every conversation that has messages, busiest first, in the shape the server already returns."""
+    try:
+        return _list_conversations(own_number)
+    except sqlite3.Error as exc:
+        raise _reading("list your conversations", exc) from exc
+
+
+def _list_conversations(own_number):
     with _connect() as conn:
         counts = {
             row["conversationId"]: (row["n"], row["last"])

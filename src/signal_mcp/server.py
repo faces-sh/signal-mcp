@@ -1692,9 +1692,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
                 client.get_conversation(
                     arguments["recipient"], limit=limit, offset=offset, since=since,
                 ),
-                asyncio.to_thread(
-                    _store.count_conversation, arguments["recipient"], since=since
-                ),
+                client.count_conversation(arguments["recipient"], since=since),
             )
             # client.get_conversation already marks incoming messages as read
             return _ok({
