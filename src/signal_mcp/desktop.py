@@ -378,11 +378,25 @@ def _read_messages_from_plain_db(plain_db: Path, own_number: str = "", since_ms:
             if not ts_ms:
                 continue
 
-            # Outgoing: source is NULL in Signal Desktop — use own account number
+            # Outgoing: source is NULL in Signal Desktop, so use the account's own number.
+            #
+            # AND RECORD WHO IT WENT TO. `Message.recipient` is documented "set for outgoing DMs" and was
+            # never set here, so every message the user sent arrived in the store with no recipient and no
+            # group. `store.list_conversations` keys a direct conversation on
+            # `CASE WHEN sender = own THEN recipient ELSE sender END`, which is NULL for those rows and is
+            # then excluded, so an imported conversation could only ever return the half somebody else
+            # wrote. Measured on a live account: 827 of the user's own direct messages orphaned, and one
+            # contact whose 76 Signal Desktop messages (36 in, 39 out) read back as 7, all inbound.
+            #
+            # Nothing said so. A corpus built from that teaches one person's prose with nothing that
+            # prompted it, which is the failure that cannot be seen afterwards.
+            group_id = _decode_group_id(row["conv_group_id"])
             if row["type"] == "outgoing":
                 sender = own_number or "me"
+                recipient = None if group_id else row["conv_e164"]
             else:
                 sender = row["source"] or row["sourceUuid"] or row["conv_e164"] or ""
+                recipient = None if group_id else (own_number or None)
 
             # Signal Desktop: readStatus=0 means read, 1=unread, NULL=unknown
             # Default unknown/old messages to read (safer than false unread counts)
@@ -394,7 +408,8 @@ def _read_messages_from_plain_db(plain_db: Path, own_number: str = "", since_ms:
                 sender=sender,
                 body=row["body"] or "",
                 timestamp=datetime.fromtimestamp(ts_ms / 1000),
-                group_id=_decode_group_id(row["conv_group_id"]),
+                group_id=group_id,
+                recipient=recipient,
                 is_read=is_read,
             ))
     except sqlite3.Error as exc:

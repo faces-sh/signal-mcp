@@ -1121,3 +1121,50 @@ def test_read_messages_zero_timestamp_after_since_filter(tmp_path):
     msgs = _read_messages_from_plain_db(db_path, since_ms=-1)
     # The Python guard `if not ts_ms: continue` kicks in and skips the row
     assert msgs == []
+
+
+def test_an_outgoing_message_records_who_it_went_to(tmp_path):
+    """AN IMPORTED CONVERSATION HAS TO HAVE BOTH SIDES IN IT.
+
+    `Message.recipient` is documented "set for outgoing DMs" and this importer never set it, so every
+    message the user had SENT landed in the store with no recipient and no group.
+    `store.list_conversations` keys a direct conversation on
+    `CASE WHEN sender = own THEN recipient ELSE sender END`, which is NULL for those rows and excluded,
+    so a per-person read could only ever return the half somebody else wrote.
+
+    Measured on a live account before the fix: 827 of the user's own direct messages orphaned, and one
+    contact whose 76 messages in Signal Desktop (36 in, 39 out) read back as 7, all inbound. Nothing
+    reported a problem, which is what makes it worth a test.
+    """
+    db_path = tmp_path / "both-sides.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, e164 TEXT, groupId TEXT)")
+    conn.execute("""CREATE TABLE messages (
+        id TEXT PRIMARY KEY, conversationId TEXT, type TEXT, body TEXT,
+        sent_at INTEGER, received_at INTEGER, source TEXT, sourceUuid TEXT, hasAttachments INTEGER
+    )""")
+    conn.execute("INSERT INTO conversations VALUES ('c1', '+15550002', NULL)")
+    conn.execute("INSERT INTO conversations VALUES ('g1', NULL, 'group-abc')")
+    conn.execute("INSERT INTO messages VALUES "
+                 "('in1', 'c1', 'incoming', 'how are you keeping', 1000, 1000, '+15550002', NULL, 0)")
+    conn.execute("INSERT INTO messages VALUES "
+                 "('out1', 'c1', 'outgoing', 'all well here', 2000, 2000, NULL, NULL, 0)")
+    conn.execute("INSERT INTO messages VALUES "
+                 "('gout', 'g1', 'outgoing', 'dinner sunday', 3000, 3000, NULL, NULL, 0)")
+    conn.commit()
+    conn.close()
+
+    by_id = {m.id: m for m in _read_messages_from_plain_db(db_path, own_number="+15550001")}
+
+    sent = by_id["desktop_out1"]
+    assert sent.sender == "+15550001"
+    assert sent.recipient == "+15550002", "an outgoing message names the person it was sent to"
+
+    received = by_id["desktop_in1"]
+    assert received.sender == "+15550002"
+    assert received.recipient == "+15550001"
+
+    # A GROUP MESSAGE IS NOT ADDRESSED TO ONE PERSON, and saying it was would file the whole group
+    # conversation under whichever member happened to be looked up first.
+    assert by_id["desktop_gout"].recipient is None
+    assert by_id["desktop_gout"].group_id == "group-abc"
