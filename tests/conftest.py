@@ -63,6 +63,18 @@ class DesktopFixture:
         return f"desktop_m{self._next}"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_signal_desktop(monkeypatch):
+    """NO TEST EVER READS THE MACHINE'S OWN SIGNAL DESKTOP.
+
+    `desktop_store.available()` is true on any developer's Mac that has Signal installed, so without this
+    the suite quietly reads their real history: it turned up as `assert 198 == 2`, 198 being the number of
+    people in one person's contact list. A test that touches real data is not a test, and on a laptop it
+    is somebody's private messages.
+    """
+    monkeypatch.setattr(_desktop_store, "available", lambda: False)
+
+
 @pytest.fixture
 def desktop(tmp_path, monkeypatch):
     """Signal Desktop, as far as `desktop_store` is concerned."""

@@ -919,6 +919,42 @@ class SignalClient:
     # ── Contacts ──────────────────────────────────────────────────────────────
 
     async def list_contacts(self, search: str | None = None) -> list[Contact]:
+        # SIGNAL DESKTOP KNOWS THESE PEOPLE BY NAME; signal-cli only knows the ones somebody pushed into
+        # it. That push exists as a separate "sync contact names" step precisely because signal-cli's own
+        # list is mostly bare numbers, and a name is how a person asks to write to somebody.
+        #
+        # BOTH SOURCES, not one: without Signal Desktop installed there is no history to read but sending
+        # still works through signal-cli, so its contacts must keep answering. Desktop's are added on top
+        # and win on name, since that is the list the person actually curated.
+        contacts = await self._contacts_from_signal_cli()
+        for extra in self._contacts_from_desktop():
+            known = next((c for c in contacts if c.number == extra.number
+                          or (c.uuid and c.uuid == extra.uuid)), None)
+            if known is None:
+                contacts.append(extra)
+            elif extra.name and not known.name:
+                known.name = extra.name
+        if search:
+            return self._matching_contacts(contacts, search)
+        return contacts
+
+    def _contacts_from_desktop(self) -> list[Contact]:
+        """The people Signal Desktop knows. Absent Desktop, none, which is not an error."""
+        if not _desktop_store.available():
+            return []
+        try:
+            rows = _desktop_store.list_contacts()
+        except Exception as exc:                       # a contact list is never worth failing a send over
+            print(f"signal: could not read Signal Desktop's contacts: {exc}", file=_sys.stderr)
+            return []
+        return [Contact(number=r.get("number") or "", uuid=r.get("uuid"),
+                        name=(r.get("name") or "").strip() or None,
+                        given_name=None, family_name=None,
+                        profile_name=(r.get("profile_name") or "").strip() or None,
+                        about=None, blocked=False)
+                for r in rows if r.get("number") or r.get("uuid")]
+
+    async def _contacts_from_signal_cli(self, search: str | None = None) -> list[Contact]:
         result = await self._rpc("listContacts")
         _expect(result, list, "listContacts")
         contacts = []
@@ -934,16 +970,22 @@ class SignalClient:
                 about=(profile.get("about") or c.get("about") or "").strip() or None,
                 blocked=c.get("isBlocked", False),
             ))
-        if search:
-            q = search.lower()
-            contacts = [
-                c for c in contacts
-                if q in (c.number or "").lower()
-                or q in (c.name or "").lower()
-                or q in (c.given_name or "").lower()
-                or q in (c.family_name or "").lower()
-            ]
-        return contacts
+        return self._matching_contacts(contacts, search)
+
+    @staticmethod
+    def _matching_contacts(contacts: list[Contact], search: str | None) -> list[Contact]:
+        """The contacts a search term matches. One filter, so both sources are searched alike."""
+        if not search:
+            return contacts
+        q = search.lower()
+        return [
+            c for c in contacts
+            if q in (c.number or "").lower()
+            or q in (c.name or "").lower()
+            or q in (c.given_name or "").lower()
+            or q in (c.family_name or "").lower()
+            or q in (c.profile_name or "").lower()
+        ]
 
     async def get_profile(self, number: str) -> Contact:
         result = await self._rpc("getUserStatus", {"recipient": [number]})

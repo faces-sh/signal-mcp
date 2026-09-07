@@ -544,8 +544,13 @@ async def test_tool_get_attachment_not_found(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_conversation_auto_marks_read():
-    """get_conversation should auto-mark received messages as read."""
+async def test_get_conversation_auto_marks_read(desktop):
+    """get_conversation should auto-mark received messages as read.
+
+    The message is in BOTH stores, which is the real situation: Signal Desktop holds the history that is
+    read, and the daemon's own store holds the copy the unread badge counts.
+    """
+    desktop.message(desktop.contact("+19999999999"), "hello", read=False)
     _store_mod.init_db()
     _store_mod.save_message(Message(
         id="msg_unread", sender="+19999999999", body="hello",
@@ -893,15 +898,10 @@ async def test_tool_list_contacts_search():
 # ── search_messages offset ────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_tool_search_messages_offset():
-    import signal_mcp.store as _store_mod
-    from signal_mcp.models import Message
-    from datetime import datetime
-    _store_mod.init_db()
-    _store_mod.save_message(Message(id="s1", sender="+1", body="keyword first",
-                                    timestamp=datetime(2024, 6, 1, 12, 0, 0)))
-    _store_mod.save_message(Message(id="s2", sender="+1", body="keyword second",
-                                    timestamp=datetime(2024, 6, 1, 11, 0, 0)))
+async def test_tool_search_messages_offset(desktop):
+    conv = desktop.contact("+1")
+    desktop.message(conv, "keyword second", when=1_700_000_001_000)
+    desktop.message(conv, "keyword first", when=1_700_000_002_000)
     result = await call_tool("search_messages", {"query": "keyword", "limit": 10, "offset": 1})
     data = json.loads(result[0].text)
     assert len(data) == 1
@@ -1392,7 +1392,7 @@ async def test_get_unread_with_service_no_warning(monkeypatch):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_list_conversations_returns_list(monkeypatch):
+async def test_list_conversations_returns_list(monkeypatch, desktop):
     """list_conversations returns a plain list — no freshen, no _warning."""
     respx.post(DAEMON_URL).mock(return_value=httpx.Response(200, json=rpc_ok([])))
     result = await call_tool("list_conversations", {})

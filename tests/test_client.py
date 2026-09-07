@@ -668,9 +668,14 @@ async def test_get_attachment_not_found_raises(client, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_conversation_auto_marks_read(client):
-    """get_conversation marks received messages as read."""
+async def test_get_conversation_auto_marks_read(client, desktop):
+    """get_conversation marks received messages as read.
+
+    TWO STORES, ONE MESSAGE: history is read from Signal Desktop, the unread badge is fed by what the
+    daemon received. Both have to hold it for this to be the real situation.
+    """
     from datetime import datetime
+    desktop.message(desktop.contact("+19999999999"), "hey", read=False)
     _store_mod.init_db()
     _store_mod.save_message(Message(
         id="rx1", sender="+19999999999", body="hey",
@@ -764,9 +769,11 @@ async def test_contact_cache_retries_after_failure(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_conversation_does_not_mark_own_messages_read(client):
+async def test_get_conversation_does_not_mark_own_messages_read(client, desktop):
     """get_conversation auto-mark-as-read skips outgoing messages."""
     from datetime import datetime
+    conv = desktop.contact("+19999999999")
+    desktop.message(conv, "hi", outgoing=True)
     _store_mod.init_db()
     # Outgoing message (sender == own account)
     _store_mod.save_message(Message(
