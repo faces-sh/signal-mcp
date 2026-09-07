@@ -979,15 +979,17 @@ async def test_identity_error_is_passed_through_unannotated(client):
 # ── Enriched list_conversations ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_list_conversations_enriches_name(monkeypatch, client):
+async def test_list_conversations_enriches_name(monkeypatch, client, desktop):
+    """THE NAME THE PERSON'S OWN CONTACTS GIVE still wins.
+
+    Signal Desktop knows a name for a conversation and so does the contact list, and the contact list is
+    the one they curated. Reading history from Desktop must not quietly rename everybody under them.
+    """
     import signal_mcp.client as _client_mod
     monkeypatch.setattr(_client_mod, "_contact_cache", {"+19999999999": "Alice"})
     monkeypatch.setattr(_client_mod, "_contact_cache_loaded", True)
-    _store_mod.init_db()
-    _store_mod.save_message(Message(
-        id="m1", sender="+19999999999", body="hi",
-        timestamp=__import__("datetime").datetime(2024, 1, 1),
-    ))
+    conv = desktop.contact("+19999999999", name="whatever Desktop calls them")
+    desktop.message(conv, "hi")
     convs = await client.list_conversations()
     assert convs[0]["name"] == "Alice"
 
@@ -1640,16 +1642,11 @@ async def test_get_unread_messages_does_not_auto_mark(client):
 # Bug 6: list_conversations must resolve group names
 @respx.mock
 @pytest.mark.asyncio
-async def test_list_conversations_resolves_group_names(client, monkeypatch):
+async def test_list_conversations_resolves_group_names(client, monkeypatch, desktop):
     """list_conversations must include resolved group name when cache is populated."""
     import signal_mcp.client as _client_mod
-    from datetime import datetime as _dt
-    _store_mod.init_db()
-    _store_mod.save_message(Message(
-        id="gcnv1", sender="+2", body="in group",
-        timestamp=_dt(2024, 6, 1), group_id="grpABC==",
-    ))
-    # Seed the group cache directly
+    conv = desktop.group("grpABC==", name="whatever Desktop calls it")
+    desktop.message(conv, "in group")
     monkeypatch.setitem(_client_mod._group_cache, "grpABC==", "My Team")
     convs = await client.list_conversations()
     group_convs = [c for c in convs if c["type"] == "group"]

@@ -255,12 +255,33 @@ async def test_locked_store_is_not_answered_with_an_empty_conversation(monkeypat
     def boom(*a, **kw):
         raise locked
 
-    monkeypatch.setattr(_store_mod, "get_conversation", boom)
+    # HISTORY COMES FROM SIGNAL DESKTOP NOW (faced#628), so that is the database that can be locked.
+    # The rule is unchanged and is the whole point of the test: the reason must reach the caller.
+    import signal_mcp.desktop_store as _desktop_store_mod
+    monkeypatch.setattr(_desktop_store_mod, "available", lambda: True)
+    monkeypatch.setattr(_desktop_store_mod, "_connect", boom)
     result = await call_tool("get_conversation", {"recipient": "+12025551234"})
 
     code, text = failure(result)
     assert code == "db_locked"
     assert "database is locked" in text
+    assert "[]" not in text
+
+
+@pytest.mark.asyncio
+async def test_no_signal_desktop_is_not_answered_with_an_empty_conversation(monkeypatch):
+    """The same rule for the other absence: no Desktop is not "they never wrote to you".
+
+    signal-cli sees only what arrives while it is running and nothing sent from another device, so there
+    is no honest fallback to a local copy: it would answer a two-sided conversation with one side of it.
+    """
+    import signal_mcp.desktop_store as _desktop_store_mod
+    monkeypatch.setattr(_desktop_store_mod, "available", lambda: False)
+    result = await call_tool("get_conversation", {"recipient": "+12025551234"})
+
+    code, text = failure(result)
+    assert code == "desktop_missing"
+    assert "Signal Desktop" in text
     assert "[]" not in text
 
 

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys as _sys
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import httpx
 
+from . import desktop_store as _desktop_store
 from .config import (
     ATTACHMENT_DIR,
     DAEMON_MESSAGES_LOG,
@@ -1086,29 +1088,54 @@ class SignalClient:
         self, recipient: str, limit: int = 50, offset: int = 0, since: datetime | None = None
     ) -> list[Message]:
         messages = await asyncio.to_thread(
-            _store.get_conversation, recipient, limit=limit, offset=offset, since=since
+            _desktop_store.get_conversation, recipient, limit=limit, offset=offset,
+            since=since, own_number=self.account,
         )
-        # Auto-mark received messages as read (like every Signal client does)
-        unread_ids = [m.id for m in messages if not m.is_read and m.sender != self.account]
-        if unread_ids:
-            await asyncio.to_thread(_store.mark_as_read, unread_ids)
-            for m in messages:
-                if m.id in unread_ids:
-                    m.is_read = True
+        await self._mark_conversation_read(recipient)
+        for m in messages:
+            m.is_read = True
         return messages
+
+    async def _mark_conversation_read(self, recipient: str) -> None:
+        """Reading a conversation marks it read, as it does in every Signal client.
+
+        THE BADGE IS FED BY A DIFFERENT STORE. History is read from Signal Desktop, but the unread count
+        comes from what the daemon received into the local store, and those rows carry their own ids: a
+        message read from Desktop cannot be marked by handing its id back. So the rows are found the way
+        the badge finds them, by conversation, and marked there.
+        """
+        try:
+            local = await asyncio.to_thread(_store.get_conversation, recipient, limit=500)
+            unread = [m.id for m in local if not m.is_read and m.sender != self.account]
+            if unread:
+                await asyncio.to_thread(_store.mark_as_read, unread)
+        except sqlite3.Error:
+            # A read is not the place to fail over the badge. The history came back; leaving a
+            # conversation looking unread is a wrong number on a badge, not a wrong answer about
+            # somebody's messages.
+            pass
+
+    async def count_conversation(self, recipient: str, since: datetime | None = None) -> int:
+        return await asyncio.to_thread(_desktop_store.count_conversation, recipient, since=since)
 
     async def search_messages(
         self, query: str, limit: int = 50, offset: int = 0, sender: str | None = None
     ) -> list[Message]:
-        return await asyncio.to_thread(_store.search_messages, query, limit=limit, offset=offset, sender=sender)
+        return await asyncio.to_thread(
+            _desktop_store.search_messages, query, limit=limit, offset=offset,
+            sender=sender, own_number=self.account,
+        )
 
     async def list_conversations(self) -> list[dict]:
-        convs = await asyncio.to_thread(_store.list_conversations, own_number=self.account)
+        convs = await asyncio.to_thread(_desktop_store.list_conversations, own_number=self.account)
+        # THE NAME THE USER'S OWN CONTACTS GIVE, still. Signal Desktop knows a name for a conversation
+        # and so does the contact list, and the contact list is the one the person curated: dropping this
+        # would rename people under them for no reason they asked for.
         for conv in convs:
             if conv["type"] == "direct":
-                conv["name"] = self.resolve_name(conv["id"])
+                conv["name"] = self.resolve_name(conv["id"]) or conv.get("name")
             elif conv["type"] == "group":
-                conv["name"] = self.resolve_group_name(conv["id"])
+                conv["name"] = self.resolve_group_name(conv["id"]) or conv.get("name")
         return convs
 
     async def clear_local_store(self) -> int:
