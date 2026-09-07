@@ -1168,3 +1168,56 @@ def test_an_outgoing_message_records_who_it_went_to(tmp_path):
     # conversation under whichever member happened to be looked up first.
     assert by_id["desktop_gout"].recipient is None
     assert by_id["desktop_gout"].group_id == "group-abc"
+
+
+def test_both_halves_of_a_conversation_share_one_handle(tmp_path):
+    """A CONVERSATION READ MATCHES ONE HANDLE, so both halves have to be keyed the same way.
+
+    `store.get_conversation` matches `sender = ? OR recipient = ?` against a single identifier. Signal
+    Desktop leaves `source` NULL and fills `sourceServiceId`, so keying incoming by that uuid while
+    keying outgoing by the conversation's phone number splits one conversation in two: a read by either
+    returns exactly half.
+
+    Measured: a real 75-message exchange (36 in, 39 out) came back as the 39 the user had sent, and
+    since none of the other person's messages were there they were all attributed to them. A corpus of
+    somebody's writing built from that is the user's own words under their father's name.
+    """
+    db_path = tmp_path / "one-handle.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, e164 TEXT, serviceId TEXT, groupId TEXT)")
+    conn.execute("""CREATE TABLE messages (
+        id TEXT PRIMARY KEY, conversationId TEXT, type TEXT, body TEXT,
+        sent_at INTEGER, received_at INTEGER, source TEXT, sourceServiceId TEXT, hasAttachments INTEGER
+    )""")
+    conn.execute("INSERT INTO conversations VALUES ('c1', '+15550002', 'uuid-of-them', NULL)")
+    # `source` NULL and `sourceServiceId` set is exactly how Signal Desktop stores an incoming message.
+    conn.execute("INSERT INTO messages VALUES "
+                 "('in1', 'c1', 'incoming', 'how are you keeping', 1000, 1000, NULL, 'uuid-of-them', 0)")
+    conn.execute("INSERT INTO messages VALUES "
+                 "('out1', 'c1', 'outgoing', 'all well here', 2000, 2000, NULL, NULL, 0)")
+    conn.commit()
+    conn.close()
+
+    by_id = {m.id: m for m in _read_messages_from_plain_db(db_path, own_number="+15550001")}
+    keys = {by_id["desktop_in1"].sender, by_id["desktop_out1"].recipient}
+    assert keys == {"+15550002"}, f"both halves name the other person the same way, got {keys}"
+
+
+def test_a_contact_with_no_number_is_still_one_conversation(tmp_path):
+    """Not everyone on Signal has a phone number shared, and they are still a person to talk to."""
+    db_path = tmp_path / "no-number.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, e164 TEXT, serviceId TEXT, groupId TEXT)")
+    conn.execute("""CREATE TABLE messages (
+        id TEXT PRIMARY KEY, conversationId TEXT, type TEXT, body TEXT,
+        sent_at INTEGER, received_at INTEGER, source TEXT, sourceServiceId TEXT, hasAttachments INTEGER
+    )""")
+    conn.execute("INSERT INTO conversations VALUES ('c1', NULL, 'uuid-only', NULL)")
+    conn.execute("INSERT INTO messages VALUES ('in1','c1','incoming','hello',1000,1000,NULL,'uuid-only',0)")
+    conn.execute("INSERT INTO messages VALUES ('out1','c1','outgoing','hi back',2000,2000,NULL,NULL,0)")
+    conn.commit()
+    conn.close()
+
+    by_id = {m.id: m for m in _read_messages_from_plain_db(db_path, own_number="+15550001")}
+    assert by_id["desktop_in1"].sender == "uuid-only"
+    assert by_id["desktop_out1"].recipient == "uuid-only"

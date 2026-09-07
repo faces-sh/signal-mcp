@@ -343,6 +343,12 @@ def _read_messages_from_plain_db(plain_db: Path, own_number: str = "", since_ms:
         else:
             source_col = "NULL AS sourceUuid"
 
+        # A contact with no phone number is still a conversation, and older Signal Desktop schemas have
+        # no `serviceId` at all, so the column is detected rather than assumed (as above).
+        conv_cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+        conv_service_col = ("c.serviceId AS conv_service_id" if "serviceId" in conv_cols
+                            else "NULL AS conv_service_id")
+
         # readStatus column present in Signal Desktop schema v39+
         # (renamed from "unread"). 1=read, 0=unread, NULL=unknown.
         if "readStatus" in msg_cols:
@@ -363,6 +369,7 @@ def _read_messages_from_plain_db(plain_db: Path, own_number: str = "", since_ms:
                 m.hasAttachments,
                 {read_col},
                 c.e164    AS conv_e164,
+                {conv_service_col},
                 c.groupId AS conv_group_id
             FROM messages m
             LEFT JOIN conversations c ON c.id = m.conversationId
@@ -391,11 +398,22 @@ def _read_messages_from_plain_db(plain_db: Path, own_number: str = "", since_ms:
             # Nothing said so. A corpus built from that teaches one person's prose with nothing that
             # prompted it, which is the failure that cannot be seen afterwards.
             group_id = _decode_group_id(row["conv_group_id"])
+            # ONE NAME FOR THE OTHER PERSON, WHICHEVER WAY THE MESSAGE WENT.
+            #
+            # A direct conversation is stored as `sender = them` on what they wrote and
+            # `recipient = them` on what the user wrote, and `store.get_conversation` matches
+            # `sender = ? OR recipient = ?` against a SINGLE handle. So if the two halves are keyed
+            # differently the read returns exactly one of them: Signal Desktop leaves `source` NULL and
+            # fills `sourceServiceId`, so incoming landed under a uuid while outgoing landed under a
+            # phone number, and a real 75-message conversation read back as the 39 the user had sent,
+            # attributed to the other person. Both halves take the conversation's own e164, falling back
+            # to its service id when a contact has no number.
+            other = None if group_id else (row["conv_e164"] or row["conv_service_id"])
             if row["type"] == "outgoing":
                 sender = own_number or "me"
-                recipient = None if group_id else row["conv_e164"]
+                recipient = other
             else:
-                sender = row["source"] or row["sourceUuid"] or row["conv_e164"] or ""
+                sender = other or row["source"] or row["sourceUuid"] or ""
                 recipient = None if group_id else (own_number or None)
 
             # Signal Desktop: readStatus=0 means read, 1=unread, NULL=unknown
